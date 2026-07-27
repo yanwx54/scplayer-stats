@@ -3,8 +3,11 @@
 # StarCraft 战术情报终端 - 一键部署脚本
 # 适用：Ubuntu 18.04 x86_64（libc6 2.27，需 Node.js 16.x）
 # 用法：bash deploy.sh
+# 端口：3001（避免与旧项目 starcraft 的 3000 冲突）
 #==============================================================
 set -e
+
+APP_PORT=3001
 
 echo "=========================================="
 echo "  StarCraft 战术情报终端 - 部署开始"
@@ -81,7 +84,7 @@ echo "  ✓ 依赖安装完成"
 echo ""
 echo "[6/6] 启动服务..."
 pm2 delete scplayer-stats 2>/dev/null || true
-pm2 start server.js --name scplayer-stats
+PORT=$APP_PORT pm2 start server.js --name scplayer-stats
 pm2 save
 # 配置开机自启（如果系统支持 systemctl）
 if command -v systemctl &>/dev/null; then
@@ -93,14 +96,14 @@ echo "  ✓ 服务已启动（PM2 守护，开机自启）"
 echo ""
 echo "配置防火墙..."
 if command -v ufw &>/dev/null; then
-  ufw allow 3000/tcp 2>/dev/null || true
-  echo "  ✓ ufw 已放行 3000 端口"
+  ufw allow ${APP_PORT}/tcp 2>/dev/null || true
+  echo "  ✓ ufw 已放行 ${APP_PORT} 端口"
 elif command -v firewall-cmd &>/dev/null; then
-  firewall-cmd --permanent --add-port=3000/tcp 2>/dev/null || true
+  firewall-cmd --permanent --add-port=${APP_PORT}/tcp 2>/dev/null || true
   firewall-cmd --reload 2>/dev/null || true
-  echo "  ✓ firewalld 已放行 3000 端口"
+  echo "  ✓ firewalld 已放行 ${APP_PORT} 端口"
 else
-  echo "  ! 未检测到防火墙工具，请确保服务商安全组放行 3000 端口"
+  echo "  ! 未检测到防火墙工具，请确保服务商安全组放行 ${APP_PORT} 端口"
 fi
 
 # ---- 完成 ----
@@ -109,7 +112,7 @@ echo "=========================================="
 echo "  ✓ 部署完成！"
 echo "=========================================="
 echo ""
-echo "  访问地址：http://199.180.116.188:3000"
+echo "  访问地址：http://199.180.116.188:${APP_PORT}"
 echo ""
 echo "  常用命令："
 echo "    pm2 status                 # 查看服务状态"
