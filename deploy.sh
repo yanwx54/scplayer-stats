@@ -16,14 +16,14 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# ---- 1. 安装 Node.js 18.x LTS ----
+# ---- 1. 安装 Node.js 20.x LTS ----
 echo ""
 echo "[1/6] 检查 Node.js..."
 if command -v node &>/dev/null && [ "$(node -v | cut -dv -f2 | cut -d. -f1)" -ge 18 ]; then
   echo "  ✓ Node.js $(node -v) 已安装"
 else
-  echo "  安装 Node.js 18.x LTS..."
-  curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+  echo "  安装 Node.js 20.x LTS..."
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
   apt-get install -y nodejs
   echo "  ✓ Node.js $(node -v) 安装完成"
 fi
