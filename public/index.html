@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>STARCRAFT // 战术情报终端</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@300;400;500;600;700&family=Share+Tech+Mono&family=Noto+Sans+KR:wght@400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- CRT scanline + grid overlay -->
+    <div class="fx-scanlines" aria-hidden="true"></div>
+    <div class="fx-vignette" aria-hidden="true"></div>
+
+    <div class="container">
+        <header class="hud-header">
+            <div class="hud-brand">
+                <span class="hud-bracket">▌</span>
+                <div>
+                    <h1>STARCRAFT<span class="dim"> // </span><span class="accent">战术情报终端</span></h1>
+                    <p class="subtitle">ELoboard 韩国职业选手 战绩查询 · 对抗分析 · 地图情报</p>
+                </div>
+            </div>
+            <div class="hud-status">
+                <span class="rec-dot"></span>
+                <span class="rec-label" id="season-tag">SEASON MAPS</span>
+                <span class="status-sep">|</span>
+                <span class="sync-info mono" id="sync-info">SYNC: -</span>
+                <button id="sync-btn" class="sync-btn" title="全量同步所有选手数据（约8分钟）">同步数据</button>
+            </div>
+        </header>
+
+        <section class="panel search-panel">
+            <div class="panel-head"><span class="ph-tag">[ 01 ]</span><span class="ph-title">SELECT OPERATIVES — 选定参战选手</span></div>
+            <div class="search-bar">
+                <div class="player-select">
+                    <label for="player1-input"><span class="lbl-num">OP-01</span> 选手 1</label>
+                    <div class="select-wrapper">
+                        <input type="text" id="player1-input" placeholder="搜索 中文 / 韩文 / ID…" autocomplete="off">
+                        <div class="dropdown" id="player1-dropdown"></div>
+                    </div>
+                </div>
+
+                <div class="vs-badge">VS</div>
+
+                <div class="player-select">
+                    <label for="player2-input"><span class="lbl-num">OP-02</span> 选手 2</label>
+                    <div class="select-wrapper">
+                        <input type="text" id="player2-input" placeholder="搜索 中文 / 韩文 / ID…" autocomplete="off">
+                        <div class="dropdown" id="player2-dropdown"></div>
+                    </div>
+                </div>
+
+                <button id="search-btn" class="search-btn" disabled>
+                    <span class="btn-txt">查询战绩</span>
+                    <span class="btn-arrow">▶</span>
+                </button>
+            </div>
+        </section>
+
+        <div id="loading" class="loading hidden">
+            <div class="spinner"></div>
+            <p id="loading-text" class="mono">// 正在获取数据…</p>
+        </div>
+
+        <div id="error" class="error hidden"></div>
+
+        <div id="results" class="results hidden">
+            <!-- SECTION: ENGAGEMENT SUMMARY -->
+            <section class="panel">
+                <div class="panel-head"><span class="ph-tag">[ 02 ]</span><span class="ph-title">ENGAGEMENT — 交战摘要</span></div>
+                <div class="summary-section">
+                    <div class="player-card player1-card" id="player1-card">
+                        <div class="dossier-stripe"><span>PERSONNEL DOSSIER // OP-01</span></div>
+                        <div class="dossier-body">
+                            <div class="player-image">
+                                <img id="p1-image" src="" alt="" onerror="this.style.display='none'">
+                                <span class="race-watermark" id="p1-race-wm"></span>
+                            </div>
+                            <div class="player-info">
+                                <h2 id="p1-name"></h2>
+                                <div class="player-meta mono" id="p1-meta"></div>
+                                <div class="player-stats">
+                                    <div class="stat"><span class="stat-value" id="p1-wins">0</span><span class="stat-label">WINS</span></div>
+                                    <div class="stat"><span class="stat-value" id="p1-winrate">0%</span><span class="stat-label">WIN RATE</span></div>
+                                    <div class="stat"><span class="stat-value" id="p1-elo">0</span><span class="stat-label">ELO</span></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="vs-section">
+                        <span class="vs-label mono">ENGAGEMENT</span>
+                        <div class="total-matches">
+                            <span class="total-label mono">总场数</span>
+                            <span class="total-value" id="total-matches">0</span>
+                        </div>
+                        <div class="score-line">
+                            <span class="score p1-score" id="p1-score">0</span>
+                            <span class="score-sep">:</span>
+                            <span class="score p2-score" id="p2-score">0</span>
+                        </div>
+                        <div class="recent-matches mono">
+                            <span class="recent-label">近30天</span>
+                            <span class="recent-value" id="recent-record">-</span>
+                        </div>
+                        <div class="elo-diff mono" id="elo-diff">ELO Δ -</div>
+                    </div>
+
+                    <div class="player-card player2-card" id="player2-card">
+                        <div class="dossier-stripe"><span>PERSONNEL DOSSIER // OP-02</span></div>
+                        <div class="dossier-body">
+                            <div class="player-image">
+                                <img id="p2-image" src="" alt="" onerror="this.style.display='none'">
+                                <span class="race-watermark" id="p2-race-wm"></span>
+                            </div>
+                            <div class="player-info">
+                                <h2 id="p2-name"></h2>
+                                <div class="player-meta mono" id="p2-meta"></div>
+                                <div class="player-stats">
+                                    <div class="stat"><span class="stat-value" id="p2-wins">0</span><span class="stat-label">WINS</span></div>
+                                    <div class="stat"><span class="stat-value" id="p2-winrate">0%</span><span class="stat-label">WIN RATE</span></div>
+                                    <div class="stat"><span class="stat-value" id="p2-elo">0</span><span class="stat-label">ELO</span></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- SECTION: THEATER MAPS (H2H) -->
+            <section class="panel">
+                <div class="panel-head"><span class="ph-tag">[ 03 ]</span><span class="ph-title">THEATER MAPS — 赛季地图直接交锋</span>
+                    <div class="map-filter-bar">
+                        <span class="mf-label mono">MAP FILTER</span>
+                        <select id="map-filter" class="map-filter"><option value="">全部地图</option></select>
+                    </div>
+                </div>
+                <div class="map-table-wrapper">
+                    <table class="map-table" id="map-table">
+                        <thead>
+                            <tr>
+                                <th class="map-name-header">MAP</th>
+                                <th class="p1-header" id="p1-map-header">OP-01</th>
+                                <th class="p2-header" id="p2-map-header">OP-02</th>
+                                <th class="h2h-header">H2H WIN%</th>
+                            </tr>
+                        </thead>
+                        <tbody id="map-tbody"></tbody>
+                    </table>
+                </div>
+                <p class="map-footnote mono">// 仅统计本赛季地图 — 地图清单可在 <code>public/maps.json</code> 按赛季更新</p>
+            </section>
+
+            <!-- SECTION: MAP INTEL — per matchup -->
+            <section class="panel">
+                <div class="panel-head"><span class="ph-tag">[ 04 ]</span><span class="ph-title">MAP INTEL — 赛季地图总战绩（分对抗）</span></div>
+                <div class="intel-grid">
+                    <div class="intel-col">
+                        <div class="intel-head">
+                            <span class="intel-name" id="p1-intel-name">OP-01</span>
+                            <span class="intel-summary mono" id="p1-intel-summary"></span>
+                        </div>
+                        <div class="intel-mu-legend mono" id="p1-mu-legend"></div>
+                        <div class="intel-scroll"><table class="intel-table" id="p1-intel-table"></table></div>
+                    </div>
+                    <div class="intel-col">
+                        <div class="intel-head">
+                            <span class="intel-name" id="p2-intel-name">OP-02</span>
+                            <span class="intel-summary mono" id="p2-intel-summary"></span>
+                        </div>
+                        <div class="intel-mu-legend mono" id="p2-mu-legend"></div>
+                        <div class="intel-scroll"><table class="intel-table" id="p2-intel-table"></table></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- SECTION: ENGAGEMENT LOG -->
+            <section class="panel">
+                <div class="panel-head"><span class="ph-tag">[ 05 ]</span><span class="ph-title">ENGAGEMENT LOG — 近 3 个月交战记录</span>
+                    <span class="ph-count mono" id="log-count"></span>
+                </div>
+                <div id="recent-log" class="recent-log"></div>
+            </section>
+        </div>
+
+        <footer class="hud-footer mono">// END OF TRANSMISSION · 数据源 eloboard.com · 仅供个人查询用途</footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

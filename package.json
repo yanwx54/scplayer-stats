@@ -1,0 +1,25 @@
+{
+  "name": "scplayer-stats",
+  "version": "1.0.0",
+  "description": "StarCraft 韩国职业选手战绩查询工具 — 对抗分析、地图情报、交战记录",
+  "scripts": {
+    "start": "node server.js",
+    "sync": "node sync.js",
+    "sync:status": "node sync.js --status"
+  },
+  "keywords": [
+    "starcraft",
+    "brood-war",
+    "eloboard",
+    "player-stats",
+    "korean-esports"
+  ],
+  "author": "yanwx54",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "axios": "^1.18.1",
+    "cheerio": "^1.2.0",
+    "express": "^5.2.1"
+  }
+}
