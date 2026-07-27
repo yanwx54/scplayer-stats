@@ -1,7 +1,7 @@
 #!/bin/bash
 #==============================================================
 # StarCraft 战术情报终端 - 一键部署脚本
-# 适用：Ubuntu 18.04 x86_64
+# 适用：Ubuntu 18.04 x86_64（libc6 2.27，需 Node.js 16.x）
 # 用法：bash deploy.sh
 #==============================================================
 set -e
@@ -16,19 +16,24 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# ---- 1. 安装 Node.js 20.x LTS ----
+# ---- 1. 安装 Node.js 16.x LTS（官方二进制，兼容 Ubuntu 18.04）----
 echo ""
 echo "[1/6] 检查 Node.js..."
-if command -v node &>/dev/null && [ "$(node -v | cut -dv -f2 | cut -d. -f1)" -ge 18 ]; then
+if command -v node &>/dev/null && [ "$(node -v | cut -dv -f2 | cut -d. -f1)" -ge 16 ]; then
   echo "  ✓ Node.js $(node -v) 已安装"
 else
-  echo "  安装 Node.js 20.x LTS..."
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
+  echo "  下载 Node.js 16.20.2 官方二进制..."
+  cd /tmp
+  if [ ! -f node-v16.20.2-linux-x64.tar.xz ]; then
+    curl -fsSL -O https://nodejs.org/dist/v16.20.2/node-v16.20.2-linux-x64.tar.xz
+  fi
+  echo "  解压安装到 /usr/local..."
+  tar -xf node-v16.20.2-linux-x64.tar.xz -C /usr/local --strip-components=1
+  rm -f node-v16.20.2-linux-x64.tar.xz
   echo "  ✓ Node.js $(node -v) 安装完成"
 fi
 
-# ---- 2. 安装 Git ----
+# ---- 2. 检查 Git ----
 echo ""
 echo "[2/6] 检查 Git..."
 if command -v git &>/dev/null; then
@@ -39,7 +44,7 @@ else
   echo "  ✓ Git 安装完成"
 fi
 
-# ---- 3. 安装 PM2（进程守护，防止服务挂掉）----
+# ---- 3. 安装 PM2（进程守护）----
 echo ""
 echo "[3/6] 检查 PM2..."
 if command -v pm2 &>/dev/null; then
@@ -54,11 +59,13 @@ fi
 echo ""
 echo "[4/6] 克隆项目..."
 APP_DIR="/opt/scplayer-stats"
-if [ -d "$APP_DIR" ]; then
+if [ -d "$APP_DIR/.git" ]; then
   echo "  目录已存在，拉取最新代码..."
   cd "$APP_DIR"
-  git pull || true
+  git fetch --all
+  git reset --hard origin/master
 else
+  rm -rf "$APP_DIR"
   git clone https://github.com/yanwx54/scplayer-stats.git "$APP_DIR"
   cd "$APP_DIR"
 fi
@@ -76,24 +83,39 @@ echo "[6/6] 启动服务..."
 pm2 delete scplayer-stats 2>/dev/null || true
 pm2 start server.js --name scplayer-stats
 pm2 save
-pm2 startup 2>/dev/null | tail -1 | bash 2>/dev/null || true
+# 配置开机自启（如果系统支持 systemctl）
+if command -v systemctl &>/dev/null; then
+  pm2 startup 2>/dev/null | grep "sudo" | bash 2>/dev/null || true
+fi
 echo "  ✓ 服务已启动（PM2 守护，开机自启）"
 
+# ---- 开放防火墙端口 ----
+echo ""
+echo "配置防火墙..."
+if command -v ufw &>/dev/null; then
+  ufw allow 3000/tcp 2>/dev/null || true
+  echo "  ✓ ufw 已放行 3000 端口"
+elif command -v firewall-cmd &>/dev/null; then
+  firewall-cmd --permanent --add-port=3000/tcp 2>/dev/null || true
+  firewall-cmd --reload 2>/dev/null || true
+  echo "  ✓ firewalld 已放行 3000 端口"
+else
+  echo "  ! 未检测到防火墙工具，请确保服务商安全组放行 3000 端口"
+fi
+
 # ---- 完成 ----
-SERVER_IP=$(curl -s ifconfig.me 2>/dev/null || echo "199.180.116.188")
 echo ""
 echo "=========================================="
 echo "  ✓ 部署完成！"
 echo "=========================================="
 echo ""
-echo "  访问地址：http://$SERVER_IP:3000"
+echo "  访问地址：http://199.180.116.188:3000"
 echo ""
 echo "  常用命令："
-echo "    pm2 status              # 查看服务状态"
-echo "    pm2 logs scplayer-stats # 查看日志"
+echo "    pm2 status                 # 查看服务状态"
+echo "    pm2 logs scplayer-stats    # 查看日志"
 echo "    pm2 restart scplayer-stats # 重启服务"
 echo "    cd /opt/scplayer-stats && node sync.js  # 手动同步数据"
 echo ""
-echo "  数据同步：项目已含全量数据（60 选手），无需再同步"
-echo "  如需更新数据：cd /opt/scplayer-stats && node sync.js"
+echo "  数据已随仓库一起部署，无需再同步"
 echo ""
