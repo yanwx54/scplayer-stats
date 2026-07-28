@@ -25,7 +25,6 @@ const seasonTag = document.getElementById('season-tag');
 const mapFilter = document.getElementById('map-filter');
 const syncInfo = document.getElementById('sync-info');
 const syncBtn = document.getElementById('sync-btn');
-const eloDiff = document.getElementById('elo-diff');
 
 // ---- Helpers ----
 function escapeHtml(text) {
@@ -293,32 +292,9 @@ function displayResults(data) {
     setText('p2-elo', fp2.elo || '-');
     setRaceWatermark('p2-race-wm', fp2.race);
 
-    setText('total-matches', fightData.totalMatches);
     setText('p1-score', fp1.wins);
     setText('p2-score', fp2.wins);
     setText('recent-record', `${fp1.recentWins} : ${fp2.recentWins}`);
-
-    // ELO 差值
-    const e1 = parseFloat(String(fp1.elo).replace(/[^\d.\-]/g, '')) || 0;
-    const e2 = parseFloat(String(fp2.elo).replace(/[^\d.\-]/g, '')) || 0;
-    if (e1 || e2) {
-        const diff = e1 - e2;
-        eloDiff.className = 'elo-diff mono';
-        if (diff > 0) {
-            eloDiff.classList.add('p1-lead');
-            eloDiff.innerHTML = `ELO Δ <span class="diff-val">+${diff.toFixed(1)}</span> · ${p1.cnName}领先`;
-        } else if (diff < 0) {
-            eloDiff.classList.add('p2-lead');
-            eloDiff.innerHTML = `ELO Δ <span class="diff-val">+${(-diff).toFixed(1)}</span> · ${p2.cnName}领先`;
-        } else {
-            eloDiff.innerHTML = `ELO Δ <span class="diff-val">0</span> · 持平`;
-        }
-    } else {
-        eloDiff.textContent = 'ELO Δ -';
-    }
-
-    setText('p1-map-header', `${p1.cnName} 胜`);
-    setText('p2-map-header', `${p2.cnName} 胜`);
 
     renderH2HMapTable(fightData.mapData, selectedMapKey);
     renderIntel('p1', p1Stats, p1, selectedMapKey);
@@ -347,61 +323,87 @@ function renderH2HMapTable(fightMapData, filterKey) {
     (fightMapData || []).forEach(m => { fightByMap[mapKey(m.mapKr)] = m; });
 
     const mapsToShow = filterKey ? seasonMaps.filter(m => mapKey(m.kr) === filterKey) : seasonMaps;
-    mapsToShow.forEach(map => {
+
+    // 从 currentData 读取选手名生成表头
+    const p1Name = currentData?.p1?.cnName ? `${currentData.p1.cnName} 胜` : 'P1 胜';
+    const p2Name = currentData?.p2?.cnName ? `${currentData.p2.cnName} 胜` : 'P2 胜';
+
+    // 创建左右两列容器
+    const leftCol = document.createElement('div');
+    leftCol.className = 'h2h-col';
+    const rightCol = document.createElement('div');
+    rightCol.className = 'h2h-col';
+
+    // 表头 HTML
+    const headHtml =
+        `<span>地图</span>` +
+        `<span>${escapeHtml(p1Name)}</span>` +
+        `<span>${escapeHtml(p2Name)}</span>` +
+        `<span>H2H</span>`;
+
+    const leftHead = document.createElement('div');
+    leftHead.className = 'h2h-head';
+    leftHead.innerHTML = headHtml;
+    leftCol.appendChild(leftHead);
+
+    const rightHead = document.createElement('div');
+    rightHead.className = 'h2h-head';
+    rightHead.innerHTML = headHtml;
+    rightCol.appendChild(rightHead);
+
+    // 生成地图项并分配到两列
+    mapsToShow.forEach((map, idx) => {
         const key = mapKey(map.kr);
         const fm = fightByMap[key] || { player1Wins: 0, player2Wins: 0, total: 0 };
         const h2hTotal = fm.player1Wins + fm.player2Wins;
         const p1Pct = h2hTotal > 0 ? Math.round(fm.player1Wins / h2hTotal * 100) : 0;
         const p2Pct = h2hTotal > 0 ? 100 - p1Pct : 0;
 
-        const tr = document.createElement('tr');
-        if (h2hTotal === 0) tr.classList.add('row-empty');
+        const item = document.createElement('div');
+        item.className = 'h2h-item';
+        if (h2hTotal === 0) item.classList.add('row-empty');
 
-        const tdMap = document.createElement('td');
-        tdMap.className = 'map-name';
-        tdMap.innerHTML = `<span class="map-cn">${escapeHtml(map.cn)}</span><span class="map-kr">${escapeHtml(map.kr)}</span>`;
-        tr.appendChild(tdMap);
+        const idxStr = String(idx + 1).padStart(2, '0');
+        const mutedCls = h2hTotal === 0 ? ' muted' : '';
+        item.innerHTML =
+            `<div class="map-name">` +
+                `<span class="map-idx">#${idxStr}</span>` +
+                `<span class="map-text">` +
+                    `<span class="map-cn">${escapeHtml(map.cn)}</span>` +
+                    `<span class="map-kr">${escapeHtml(map.kr)}</span>` +
+                `</span>` +
+            `</div>` +
+            `<div class="p1-wins${mutedCls}">${h2hTotal > 0 ? fm.player1Wins : '·'}</div>` +
+            `<div class="p2-wins${mutedCls}">${h2hTotal > 0 ? fm.player2Wins : '·'}</div>` +
+            `<div class="bar-cell">` +
+                `<div class="bar-container">` +
+                    `<div class="bar-p1" style="width:${p1Pct}%"></div>` +
+                    `<div class="bar-p2" style="width:${p2Pct}%"></div>` +
+                `</div>` +
+                `<div class="bar-label">${h2hTotal > 0 ? p1Pct + '% : ' + p2Pct + '%' : 'NO ENGAGEMENT'}</div>` +
+            `</div>`;
 
-        const td1 = document.createElement('td');
-        td1.className = 'p1-wins';
-        td1.textContent = h2hTotal > 0 ? fm.player1Wins : '·';
-        if (h2hTotal === 0) td1.classList.add('muted');
-        tr.appendChild(td1);
-
-        const td2 = document.createElement('td');
-        td2.className = 'p2-wins';
-        td2.textContent = h2hTotal > 0 ? fm.player2Wins : '·';
-        if (h2hTotal === 0) td2.classList.add('muted');
-        tr.appendChild(td2);
-
-        const tdBar = document.createElement('td');
-        tdBar.className = 'bar-cell';
-        const bar = document.createElement('div');
-        bar.className = 'bar-container';
-        const b1 = document.createElement('div'); b1.className = 'bar-p1'; b1.style.width = p1Pct + '%';
-        const b2 = document.createElement('div'); b2.className = 'bar-p2'; b2.style.width = p2Pct + '%';
-        bar.appendChild(b1); bar.appendChild(b2);
-        const lbl = document.createElement('div'); lbl.className = 'bar-label';
-        lbl.textContent = h2hTotal > 0 ? `${p1Pct}% : ${p2Pct}%` : 'NO ENGAGEMENT';
-        tdBar.appendChild(bar); tdBar.appendChild(lbl);
-        tr.appendChild(tdBar);
-
-        tbody.appendChild(tr);
+        if (idx % 2 === 0) {
+            leftCol.appendChild(item);
+        } else {
+            rightCol.appendChild(item);
+        }
     });
+
+    tbody.appendChild(leftCol);
+    tbody.appendChild(rightCol);
 }
 
 // ---- Map intel (per matchup) ----
 function renderIntel(prefix, stats, player, filterKey) {
     const nameEl = document.getElementById(`${prefix}-intel-name`);
     const sumEl = document.getElementById(`${prefix}-intel-summary`);
-    const legendEl = document.getElementById(`${prefix}-mu-legend`);
     const tableEl = document.getElementById(`${prefix}-intel-table`);
 
     nameEl.textContent = `${player.cnName} · ${player.krName}`;
 
     if (!stats) {
         sumEl.textContent = '数据不可用';
-        legendEl.innerHTML = '';
         tableEl.innerHTML = '';
         return;
     }
@@ -435,15 +437,6 @@ function renderIntel(prefix, stats, player, filterKey) {
     }
     sumEl.textContent = parts.join('  ·  ');
 
-    // legend chips
-    legendEl.innerHTML = '';
-    MU_OPP_ORDER.forEach(opp => {
-        const chip = document.createElement('span');
-        chip.className = 'mu-chip';
-        chip.innerHTML = `<span class="mu-dot" style="background:${RACE_COLOR[opp]}"></span>${race}v${opp}`;
-        legendEl.appendChild(chip);
-    });
-
     // table
     let html = '<thead><tr><th class="map-col-h" style="text-align:left">MAP</th>';
     MU_OPP_ORDER.forEach(opp => {
@@ -470,7 +463,12 @@ function renderIntel(prefix, stats, player, filterKey) {
 
 function muCell(mu, isTotal) {
     if (!mu || mu.total === 0) return `<span class="cell-zero">—</span>`;
-    return `<span class="rec-wins">${mu.wins}</span><span class="rec-sep">-</span><span class="rec-losses">${mu.losses}</span>`;
+    const w = mu.wins;
+    const l = mu.losses;
+    // 大数红、小数绿、平局左红右绿
+    const wCls = (w >= l) ? 'rec-big' : 'rec-small';
+    const lCls = (l > w) ? 'rec-big' : 'rec-small';
+    return `<span class="${wCls}">${w}</span><span class="rec-sep">-</span><span class="${lCls}">${l}</span>`;
 }
 
 // ---- Recent engagement log (last 6 months, paginated) ----

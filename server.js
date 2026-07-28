@@ -142,6 +142,7 @@ app.get('/api/fight', async (req, res) => {
         const p2Info = parsePlayerNameRace(p2Text);
 
         const row1Spans = summaryTable.find('tr').first().find('span');
+        console.log('[fight] row1Spans count:', row1Spans.length, 'p1Text:', p1Text, 'p2Text:', p2Text);
         const player1Wins = parseInt(row1Spans.eq(0).text().trim()) || 0;
         const player1WinRate = row1Spans.eq(1).text().trim();
         const player1Elo = row1Spans.eq(2).text().trim();

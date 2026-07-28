@@ -93,7 +93,7 @@ function readPlayerData(wrId) {
 }
 
 // ---- Fetch + parse a player's page from eloboard ----
-async function fetchAndParsePlayer(wrId) {
+async function fetchAndParsePlayer(wrId, opts = {}) {
     const response = await axios.get(PLAYER_PAGE_URL(wrId), { headers, timeout: 45000 });
     const $ = cheerio.load(response.data);
 
@@ -217,7 +217,38 @@ async function fetchAndParsePlayer(wrId) {
         });
     });
 
-    return { wrId, race, matchCount: matches.length, matches, storyByOpp, fetchedAt: new Date().toISOString() };
+    // ---- 解析 맵별통계 표 (eloboard 공식 집계 맵별 대종족 전적) ----
+    // 개인 홈페이지의 여러 .list-board 중 "저그전"+"총전적" 포함 것이 맵별통계 표
+    // 열 순서: 맵 | 저그전(Z) | 프로토스전(P) | 테란전(T) | 총전적 | 승률
+    const mapStats = {};
+    // 이 표는 .list-board 내에 없고, td[width="25%"] + td[width="15%"]*5 구조를 가짌
+    // 열 순서: 맵 | 저그전(Z) | 프로토스전(P) | 테란전(T) | 총전적 | 승률
+    $('tr').each((i, el) => {
+        const tds = $(el).find('td');
+        if (tds.length < 6) return;
+        const firstTd = $(tds[0]);
+        if (firstTd.attr('width') !== '25%') return;
+        const mapName = firstTd.text().trim();
+        if (!mapName || mapName === '맵') return;
+        const parseWL = (text) => {
+            const m = text.match(/(\d+)승\s*(\d+)패/);
+            return m ? { wins: parseInt(m[1]), losses: parseInt(m[2]) } : { wins: 0, losses: 0 };
+        };
+        const vsZ = parseWL($(tds[1]).text().trim());
+        const vsP = parseWL($(tds[2]).text().trim());
+        const vsT = parseWL($(tds[3]).text().trim());
+        const key = normalize(mapName);
+        if (mapStats[key]) {
+            mapStats[key].vsZ.wins += vsZ.wins; mapStats[key].vsZ.losses += vsZ.losses;
+            mapStats[key].vsP.wins += vsP.wins; mapStats[key].vsP.losses += vsP.losses;
+            mapStats[key].vsT.wins += vsT.wins; mapStats[key].vsT.losses += vsT.losses;
+        } else {
+            mapStats[key] = { mapKr: mapName, vsZ, vsP, vsT };
+        }
+    });
+
+
+    return { wrId, race, matchCount: matches.length, matches, storyByOpp, mapStats, fetchedAt: new Date().toISOString() };
 }
 
 // ---- Save player data to local file ----
@@ -228,7 +259,7 @@ function savePlayerData(wrId, data) {
 
 // ---- Sync one player (full re-fetch) ----
 async function syncPlayer(wrId, opts = {}) {
-    const data = await fetchAndParsePlayer(wrId);
+    const data = await fetchAndParsePlayer(wrId, opts);
     savePlayerData(wrId, data);
 
     const meta = readMeta();
@@ -288,31 +319,88 @@ function computeMapStats(wrId) {
     const RACE_ORDER = ['T', 'Z', 'P'];
     const muKeys = race !== '?' ? RACE_ORDER.map(o => `${race}v${o}`) : [];
 
-    // per-map per-matchup aggregation
     const statsByMap = {};
     const matchupTotals = {};
     muKeys.forEach(k => matchupTotals[k] = { wins: 0, losses: 0, total: 0 });
     let totalWins = 0, totalLosses = 0;
 
-    data.matches.forEach(r => {
-        if (!r.isSeasonMap) return; // season maps only
-        const key = normalize(r.mapKr);
-        if (!statsByMap[key]) {
-            const mapDef = SEASON_MAPS.find(m => normalize(m.kr) === key) || { kr: r.mapKr, cn: r.mapCn };
-            statsByMap[key] = { kr: mapDef.kr, cn: mapDef.cn, matchups: {} };
-            muKeys.forEach(k => statsByMap[key].matchups[k] = { wins: 0, losses: 0, total: 0 });
-        }
-        const muKey = race !== '?' && r.oppRace ? `${race}v${r.oppRace}` : null;
-        if (muKey && statsByMap[key].matchups[muKey]) {
-            if (r.isWin) { statsByMap[key].matchups[muKey].wins++; matchupTotals[muKey].wins++; }
-            else { statsByMap[key].matchups[muKey].losses++; matchupTotals[muKey].losses++; }
-            statsByMap[key].matchups[muKey].total++;
-            matchupTotals[muKey].total++;
-        }
-        if (r.isWin) totalWins++; else totalLosses++;
-    });
+    const mapStatsRaw = data.mapStats || {};
+    const hasFullMapStats = Object.keys(mapStatsRaw).length > 0;
 
-    // build full season-map list
+    if (hasFullMapStats) {
+        // mapStats 已包含全量赛季地图统计（来自 맵별통계 표 或 view_list.php 全量加载）
+        SEASON_MAPS.forEach(mapDef => {
+            const key = normalize(mapDef.kr);
+            const raw = mapStatsRaw[key];
+            if (!raw) return;
+            const matchups = {};
+            let mapW = 0, mapL = 0;
+            const cols = [['Z', raw.vsZ], ['P', raw.vsP], ['T', raw.vsT]];
+            cols.forEach(([opp, v]) => {
+                const muKey = `${race}v${opp}`;
+                const w = v.wins || 0, l = v.losses || 0;
+                matchups[muKey] = { wins: w, losses: l, total: w + l };
+                mapW += w; mapL += l;
+            });
+            statsByMap[key] = { kr: mapDef.kr, cn: mapDef.cn, matchups };
+            Object.entries(matchups).forEach(([k, v]) => {
+                matchupTotals[k].wins += v.wins;
+                matchupTotals[k].losses += v.losses;
+                matchupTotals[k].total += v.total;
+            });
+            totalWins += mapW; totalLosses += mapL;
+        });
+    } else {
+        // fallback: 从 storyByOpp + matches 累加
+        const seenMatchKeys = new Set();
+        function addMatch(mapName, isWin, oppRace) {
+            const matched = matchSeasonMap(mapName);
+            if (!matched) return;
+            const key = normalize(matched.kr);
+            if (!statsByMap[key]) {
+                statsByMap[key] = { kr: matched.kr, cn: matched.cn, matchups: {} };
+                muKeys.forEach(k => statsByMap[key].matchups[k] = { wins: 0, losses: 0, total: 0 });
+            }
+            const muKey = race !== '?' && oppRace ? `${race}v${oppRace}` : null;
+            if (muKey && statsByMap[key].matchups[muKey]) {
+                if (isWin) { statsByMap[key].matchups[muKey].wins++; matchupTotals[muKey].wins++; }
+                else { statsByMap[key].matchups[muKey].losses++; matchupTotals[muKey].losses++; }
+                statsByMap[key].matchups[muKey].total++;
+                matchupTotals[muKey].total++;
+            }
+            if (isWin) totalWins++; else totalLosses++;
+        }
+
+        const oppRaceMap = {};
+        (data.matches || []).forEach(m => {
+            if (m.oppWrId && m.oppRace) oppRaceMap[m.oppWrId] = m.oppRace;
+        });
+
+        const storyByOpp = data.storyByOpp || {};
+        Object.entries(storyByOpp).forEach(([oppWrId, matches2]) => {
+            let oppRace = oppRaceMap[oppWrId] || '';
+            if (!oppRace) {
+                const oppData = readPlayerData(oppWrId);
+                if (oppData && oppData.race) oppRace = oppData.race;
+            }
+            (matches2 || []).forEach(m => {
+                const mk = `${m.date}|${m.mapName}|${m.format}|${m.viewerWon}`;
+                if (seenMatchKeys.has(mk)) return;
+                seenMatchKeys.add(mk);
+                addMatch(m.mapName, m.viewerWon, oppRace);
+            });
+        });
+
+        (data.matches || []).forEach(r => {
+            if (!r.isSeasonMap) return;
+            const mk = `${r.date}|${r.mapKr || r.mapName}|${r.format}|${r.isWin}`;
+            if (seenMatchKeys.has(mk)) return;
+            seenMatchKeys.add(mk);
+            addMatch(r.mapKr || r.mapName, r.isWin, r.oppRace);
+        });
+    }
+
+    // 3. 构建完整赛季地图列表输出
     const mapStats = SEASON_MAPS.map(m => {
         const key = normalize(m.kr);
         const s = statsByMap[key];
