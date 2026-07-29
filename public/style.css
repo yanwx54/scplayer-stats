@@ -366,6 +366,9 @@ body {
 }
 .h2h-col .h2h-head > span { text-align: center; }
 .h2h-col .h2h-head > span:first-child { text-align: left; }
+/* H2H 表头字号：第1列「地图」11px，其余 12px */
+#map-tbody .h2h-col .h2h-head > span { font-size: 12px; }
+#map-tbody .h2h-col:nth-child(1) .h2h-head > span:nth-child(1) { font-size: 11px; }
 
 .h2h-item {
     display: grid;
@@ -437,9 +440,16 @@ body {
 .intel-scroll { max-height: 400px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); }
 .intel-scroll .data-table th { position: sticky; top: 0; z-index: 1; }
 
-/* intel table cells */
-.map-col .ic-cn { font-weight: 600; }
-.map-col .ic-kr { color: var(--text-faint); font-size: 11px; margin-left: 4px; }
+/* intel table cells — 地图名中韩文上下两行（参考 [03]） */
+.map-col .ic-cn { display: block; font-weight: 600; line-height: 1.25; }
+.map-col .ic-kr { display: block; color: var(--text-faint); font-size: 11px; margin-top: 1px; line-height: 1.2; }
+/* intel 表格均匀布局 */
+.intel-scroll .data-table { table-layout: fixed; }
+.intel-scroll .data-table th,
+.intel-scroll .data-table td { padding: 8px 10px; text-align: center; }
+.intel-scroll .data-table th.map-col-h,
+.intel-scroll .data-table td.map-col { text-align: left; }
+.intel-scroll .data-table .map-col { width: 30%; }
 .cell-zero { color: var(--text-faint); }
 .rec-wins { color: var(--win); font-weight: 600; }
 .rec-sep { color: var(--text-faint); margin: 0 2px; }
