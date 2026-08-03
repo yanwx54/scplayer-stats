@@ -163,7 +163,6 @@ function selectPlayer(player, playerNum, input, dropdown) {
     if (player.wrId) {
         fetch(`/api/sync-player?wrId=${player.wrId}`).catch(() => {});
     }
-    if (selectedPlayer1 && selectedPlayer2) handleSearch();
 }
 
 function updateSearchButton() {
