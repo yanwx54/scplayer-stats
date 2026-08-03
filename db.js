@@ -257,18 +257,32 @@ function savePlayerData(wrId, data) {
     fs.writeFileSync(file, JSON.stringify(data));
 }
 
-// ---- Sync one player (full re-fetch) ----
+// ---- Sync one player (full re-fetch, with retry) ----
 async function syncPlayer(wrId, opts = {}) {
-    const data = await fetchAndParsePlayer(wrId, opts);
-    savePlayerData(wrId, data);
+    const retries = opts.retries || 0;
+    let lastErr;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const data = await fetchAndParsePlayer(wrId, opts);
+            savePlayerData(wrId, data);
 
-    const meta = readMeta();
-    meta.playerSync = meta.playerSync || {};
-    meta.playerSync[wrId] = { time: new Date().toISOString(), matchCount: data.matchCount };
-    writeMeta(meta);
+            const meta = readMeta();
+            meta.playerSync = meta.playerSync || {};
+            meta.playerSync[wrId] = { time: new Date().toISOString(), matchCount: data.matchCount };
+            writeMeta(meta);
 
-    if (!opts.silent) console.log(`  ✓ wrId=${wrId} race=${data.race} matches=${data.matchCount}`);
-    return data;
+            if (!opts.silent) console.log(`  ✓ wrId=${wrId} race=${data.race} matches=${data.matchCount}`);
+            return data;
+        } catch (e) {
+            lastErr = e;
+            if (attempt < retries) {
+                const wait = 2000 * (attempt + 1); // 2s / 4s / 6s 递增退避
+                if (!opts.silent) console.log(`  ⚠ wrId=${wrId} 第${attempt + 1}次失败(${e.message})，${wait / 1000}s 后重试`);
+                await new Promise(r => setTimeout(r, wait));
+            }
+        }
+    }
+    throw lastErr;
 }
 
 // ---- Sync all players ----
@@ -281,8 +295,9 @@ async function syncAll(players, opts = {}) {
 
     for (let i = 0; i < players.length; i += concurrency) {
         const batch = players.slice(i, i + concurrency);
+        const retries = opts.retries || 2; // 网络抖动自动重试
         const results = await Promise.allSettled(
-            batch.map(p => syncPlayer(p.wrId, { silent: true }))
+            batch.map(p => syncPlayer(p.wrId, { silent: true, retries }))
         );
         results.forEach((r, idx) => {
             const p = batch[idx];
@@ -541,6 +556,120 @@ function computeRecentMatches(wrId1, wrId2) {
     return { count: recent.length, recentMatches: recent };
 }
 
+// ---- Compute head-to-head summary from LOCAL data (no remote request) ----
+// 从双方 storyByOpp（同步时已抓取的全量互相对战）+ matches 合并统计，
+// 毫秒级返回，字段结构与远程 /api/fight 对齐。
+// 返回 null 表示本地数据不完整（任一方无本地文件），调用方应回退远程抓取。
+function computeH2H(wrId1, wrId2) {
+    const d1 = readPlayerData(wrId1);
+    const d2 = readPlayerData(wrId2);
+    if (!d1 || !d2) return null;
+
+    // 去重 key: date + mapName + 胜者 + format（与 computeRecentMatches 一致）
+    const seen = new Map();
+
+    // 从 wrId1 主页的 storyByOpp[wrId2] 取全量对战（wrId1 视角）
+    if (d1.storyByOpp && d1.storyByOpp[wrId2]) {
+        d1.storyByOpp[wrId2].forEach(r => {
+            const winner = r.viewerWon ? 'p1' : 'p2';
+            const key = `${r.date}|${r.mapName}|${winner}|${r.format}`;
+            if (!seen.has(key)) {
+                seen.set(key, { date: r.date, mapName: r.mapName, format: r.format, winner });
+            }
+        });
+    }
+
+    // 从 wrId2 主页的 storyByOpp[wrId1] 取全量对战（wrId2 视角，镜像）
+    if (d2.storyByOpp && d2.storyByOpp[wrId1]) {
+        d2.storyByOpp[wrId1].forEach(r => {
+            const winner = r.viewerWon ? 'p2' : 'p1';
+            const key = `${r.date}|${r.mapName}|${winner}|${r.format}`;
+            if (!seen.has(key)) {
+                seen.set(key, { date: r.date, mapName: r.mapName, format: r.format, winner });
+            }
+        });
+    }
+
+    // 补充近期列表（双保险：storyByOpp 没覆盖到的场景）
+    const mapOne = (data, oppWrId, viewerIsP1) => {
+        if (!data || !data.matches) return;
+        data.matches
+            .filter(r => r.oppWrId === oppWrId)
+            .forEach(r => {
+                const viewerWon = r.isWin;
+                const winner = (viewerIsP1 === viewerWon) ? 'p1' : 'p2';
+                const key = `${r.date}|${r.mapName}|${winner}|${r.format}`;
+                if (!seen.has(key)) {
+                    seen.set(key, { date: r.date, mapName: r.mapName, format: r.format, winner });
+                }
+            });
+    };
+    mapOne(d1, wrId2, true);
+    mapOne(d2, wrId1, false);
+
+    const records = [...seen.values()];
+    const totalMatches = records.length;
+
+    let wins1 = 0, wins2 = 0, recentWins1 = 0, recentWins2 = 0;
+    const now = Date.now();
+    const monthMs = 30 * 24 * 60 * 60 * 1000;
+    const mapTally = {}; // key: normalize(mapKr) -> { p1: n, p2: n }
+
+    records.forEach(r => {
+        if (r.winner === 'p1') wins1++; else wins2++;
+
+        const date = new Date(r.date + 'T00:00:00');
+        const isRecent = date.getTime() && (now - date.getTime()) <= monthMs;
+        if (isRecent) {
+            if (r.winner === 'p1') recentWins1++; else recentWins2++;
+        }
+
+        const matched = matchSeasonMap(r.mapName);
+        if (matched) {
+            const key = normalize(matched.kr);
+            if (!mapTally[key]) mapTally[key] = { p1: 0, p2: 0 };
+            if (r.winner === 'p1') mapTally[key].p1++; else mapTally[key].p2++;
+        }
+    });
+
+    // mapData 按 SEASON_MAPS 顺序输出，仅保留有交战的赛季地图
+    const mapData = [];
+    SEASON_MAPS.forEach(m => {
+        const key = normalize(m.kr);
+        const t = mapTally[key];
+        if (!t) return;
+        mapData.push({
+            mapKr: m.kr, mapCn: m.cn, mapFull: m.full,
+            player1Wins: t.p1, player2Wins: t.p2, total: t.p1 + t.p2,
+        });
+    });
+
+    const fmtRate = (w, l) => {
+        const total = w + l;
+        return total > 0 ? ((w / total) * 100).toFixed(1) + '%' : '0%';
+    };
+    const mkPlayer = (wrId, data, wins, losses, recentWins) => ({
+        name: '', // server 端补充韩文名
+        race: data.race || '',
+        displayName: '',
+        image: '',
+        wrId,
+        wins,
+        winRate: fmtRate(wins, losses),
+        elo: null, // 本地库不存当前 ELO 值
+        recentWins,
+        topOpponents: [],
+    });
+
+    return {
+        source: 'local',
+        player1: mkPlayer(wrId1, d1, wins1, wins2, recentWins1),
+        player2: mkPlayer(wrId2, d2, wins2, wins1, recentWins2),
+        totalMatches,
+        mapData,
+    };
+}
+
 // ---- 从 eloboard 网页实时抓取双人全量对战（storyb 详情）----
 // board 1 的对手汇总行 td[5] 有 moreb{N}，对应 storyb{N} TR 元素
 // storyb{N} 内嵌套 table，每行是一场单场比赛（5 列：日期/地图/胜负elo/方式/备注）
@@ -705,6 +834,7 @@ module.exports = {
     syncAll,
     computeMapStats,
     computeRecentMatches,
+    computeH2H,
     getStats,
     SEASON_MAPS,
 };

@@ -104,11 +104,30 @@ app.get('/api/sync-all', async (req, res) => {
     }
 });
 
-// ---- API: head-to-head (remote, ~3.5s, cached) ----
+// ---- API: head-to-head (local-first, remote fallback) ----
 app.get('/api/fight', async (req, res) => {
     try {
-        const { player1, player2 } = req.query;
+        const { player1, player2, wrId1, wrId2 } = req.query;
         if (!player1 || !player2) return res.status(400).json({ error: 'Both player1 and player2 are required' });
+
+        // 本地优先：双方均有本地数据时毫秒级返回（无远程请求）
+        if (wrId1 && wrId2) {
+            const local = db.computeH2H(wrId1, wrId2);
+            if (local) {
+                const players = parsePlayersFromMd();
+                const p1Def = players.find(p => p.wrId === wrId1);
+                const p2Def = players.find(p => p.wrId === wrId2);
+                if (p1Def) {
+                    local.player1.name = p1Def.krName;
+                    local.player1.displayName = p1Def.krName + (local.player1.race || '');
+                }
+                if (p2Def) {
+                    local.player2.name = p2Def.krName;
+                    local.player2.displayName = p2Def.krName + (local.player2.race || '');
+                }
+                return res.json(local);
+            }
+        }
 
         const cacheKey = `${player1}|${player2}`;
         const cached = fightCache.get(cacheKey);

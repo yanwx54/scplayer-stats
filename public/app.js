@@ -187,7 +187,8 @@ async function handleSearch() {
         const p2 = selectedPlayer2;
 
         const fightPromise = fetch(
-            `/api/fight?player1=${encodeURIComponent(p1.krName)}&player2=${encodeURIComponent(p2.krName)}`
+            `/api/fight?player1=${encodeURIComponent(p1.krName)}&player2=${encodeURIComponent(p2.krName)}` +
+            `&wrId1=${p1.wrId || ''}&wrId2=${p2.wrId || ''}`
         ).then(r => r.ok ? r.json() : r.json().then(e => Promise.reject(e)));
 
         const mkStats = (wrId) => wrId
