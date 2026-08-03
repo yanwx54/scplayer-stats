@@ -107,6 +107,13 @@ async function fetchAndParsePlayer(wrId, opts = {}) {
         }
     });
 
+    // extract avatar: 页面顶部选手信息卡的第一张 w=120 头像图
+    let avatar = '';
+    $('img[width="120"]').each((i, el) => {
+        if (avatar) return;
+        avatar = $(el).attr('src') || '';
+    });
+
     // extract all match rows
     // 页面有多个 .list-board，比赛数据所在的那个不确定（不同选手 index 不同），
     // 遍历所有 .list-board，取含比赛数据行（td style 含 #0cf 胜/#434348 负）的那个
@@ -248,7 +255,7 @@ async function fetchAndParsePlayer(wrId, opts = {}) {
     });
 
 
-    return { wrId, race, matchCount: matches.length, matches, storyByOpp, mapStats, fetchedAt: new Date().toISOString() };
+    return { wrId, race, avatar, matchCount: matches.length, matches, storyByOpp, mapStats, fetchedAt: new Date().toISOString() };
 }
 
 // ---- Save player data to local file ----
@@ -652,7 +659,7 @@ function computeH2H(wrId1, wrId2) {
         name: '', // server 端补充韩文名
         race: data.race || '',
         displayName: '',
-        image: '',
+        image: data.avatar || '',
         wrId,
         wins,
         winRate: fmtRate(wins, losses),
