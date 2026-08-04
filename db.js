@@ -97,13 +97,17 @@ async function fetchAndParsePlayer(wrId, opts = {}) {
     const response = await axios.get(PLAYER_PAGE_URL(wrId), { headers, timeout: 45000 });
     const $ = cheerio.load(response.data);
 
-    // extract race from 주종 row
+    // extract race from 주종 row + current ELO
     let race = '';
+    let elo = '';
     $('th').each((i, el) => {
-        if (race) return;
-        if ($(el).text().trim() === '주종') {
+        if (race && elo) return;
+        const label = $(el).text().trim();
+        if (label === '주종' && !race) {
             const val = $(el).next('td').text().trim();
             race = RACE_FULL[val] || '';
+        } else if (label === 'ELO' && !elo) {
+            elo = $(el).next('td').text().trim();
         }
     });
 
@@ -255,7 +259,7 @@ async function fetchAndParsePlayer(wrId, opts = {}) {
     });
 
 
-    return { wrId, race, avatar, matchCount: matches.length, matches, storyByOpp, mapStats, fetchedAt: new Date().toISOString() };
+    return { wrId, race, elo, avatar, matchCount: matches.length, matches, storyByOpp, mapStats, fetchedAt: new Date().toISOString() };
 }
 
 // ---- Save player data to local file ----
@@ -663,7 +667,7 @@ function computeH2H(wrId1, wrId2) {
         wrId,
         wins,
         winRate: fmtRate(wins, losses),
-        elo: null, // 本地库不存当前 ELO 值
+        elo: data.elo || null, // 同步时抓取的当前 ELO
         recentWins,
         topOpponents: [],
     });
