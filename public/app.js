@@ -108,7 +108,12 @@ function setupPlayerSearch(input, dropdown, playerNum) {
         if (playerNum === 1) selectedPlayer1 = null;
         else selectedPlayer2 = null;
         updateSearchButton();
-        if (query.length === 0) { dropdown.classList.remove('active'); return; }
+        if (query.length === 0) {
+            // 清空输入框时直接显示全部选手（与 focus 行为一致），无需二次点击
+            if (allPlayers.length > 0) renderDropdown(dropdown, allPlayers, playerNum, input);
+            else dropdown.classList.remove('active');
+            return;
+        }
         const q = normalizeStr(query);
         const filtered = allPlayers.filter(p =>
             normalizeStr(p.cnName).includes(q) ||
