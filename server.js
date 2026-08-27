@@ -104,7 +104,7 @@ app.post('/api/upload-data', express.json({ limit: '30mb' }), (req, res) => {
     if (!UPLOAD_TOKEN) return res.status(503).json({ error: '上传未启用：请在服务器创建 data/upload-token.txt' });
     const auth = req.headers.authorization || '';
     if (auth !== 'Bearer ' + UPLOAD_TOKEN) return res.status(401).json({ error: 'unauthorized' });
-    const { meta, players } = req.body || {};
+    const { meta, players, avatars } = req.body || {};
     if (!players || typeof players !== 'object') return res.status(400).json({ error: 'players required' });
 
     const playersDir = path.join(__dirname, 'data', 'players');
@@ -116,8 +116,23 @@ app.post('/api/upload-data', express.json({ limit: '30mb' }), (req, res) => {
         count++;
     }
     if (meta) atomicWrite(path.join(__dirname, 'data', 'meta.json'), JSON.stringify(meta, null, 2));
-    console.log(`[upload] 收到并写入 ${count} 个选手数据`);
-    res.json({ ok: true, playersWritten: count });
+
+    // 头像（base64 → data/avatars/{wrId}.{ext}，经 /avatars 静态提供）
+    let avatarCount = 0;
+    if (avatars && typeof avatars === 'object') {
+        const avDir = path.join(__dirname, 'data', 'avatars');
+        fs.mkdirSync(avDir, { recursive: true });
+        for (const [name, b64] of Object.entries(avatars)) {
+            if (!/^\d+\.(jpg|jpeg|png|gif|webp)$/.test(name)) continue; // 文件名白名单，防路径注入
+            try {
+                atomicWrite(path.join(avDir, name), Buffer.from(b64, 'base64'));
+                avatarCount++;
+            } catch (e) { console.warn(`[upload] 头像写入失败 ${name}: ${e.message}`); }
+        }
+    }
+
+    console.log(`[upload] 收到并写入 ${count} 个选手数据${avatarCount > 0 ? `，${avatarCount} 个头像` : ''}`);
+    res.json({ ok: true, playersWritten: count, avatarsWritten: avatarCount });
 });
 
 // ---- API: head-to-head (local-first, remote fallback) ----
@@ -261,6 +276,9 @@ app.get('/api/recent-matches', (req, res) => {
         res.status(500).json({ error: 'Failed', detail: error.message });
     }
 });
+
+// 头像本地静态服务（eloboard 外链被 Cloudflare 拦，头像已随同步本地化）
+app.use('/avatars', express.static(path.join(__dirname, 'data', 'avatars')));
 
 app.use(express.static(path.join(__dirname, 'public')));
 

@@ -13,6 +13,7 @@
  *   node local-sync.js 12 33         # 只同步指定 wrId（测试用）
  *   node local-sync.js --no-upload   # 只同步不上传
  *   node local-sync.js --upload-only # 跳过抓取，直接推送本地已有数据（服务器可达后补传）
+ *   node local-sync.js --avatars-only # 只下载选手头像（eloboard 外链被拦，头像本地化）
  *
  * 依赖：npm i -D playwright
  * 前置：无需手动操作 — 若 9222 调试端口未开放，脚本自动以独立 profile
@@ -59,6 +60,7 @@ function parseArgs() {
         wrIds: args.filter(a => /^\d+$/.test(a)),
         noUpload: args.includes('--no-upload'),
         uploadOnly: args.includes('--upload-only'), // 跳过抓取，直接推送本地已有数据
+        avatarsOnly: args.includes('--avatars-only'), // 只下载头像（不重抓比赛数据）
         full: args.includes('--full'),              // 强制全量（默认增量：只同步活跃选手）
     };
 }
@@ -230,6 +232,57 @@ function makeFetcher(context) {
     };
 }
 
+// ---- 下载选手头像到本地（eloboard 外链被 Cloudflare 拦，必须本地化）----
+// 用浏览器 context 请求（自带 cf_clearance cookie）；URL 未变且文件已存在则跳过
+async function downloadAvatars(context, players) {
+    const AV_DIR = path.join(DATA_DIR, 'avatars');
+    if (!fs.existsSync(AV_DIR)) fs.mkdirSync(AV_DIR, { recursive: true });
+    const INDEX_FILE = path.join(AV_DIR, 'index.json'); // wrId → 已下载的源 URL
+    let index = {};
+    try { index = JSON.parse(fs.readFileSync(INDEX_FILE, 'utf8')); } catch (e) {}
+
+    let downloaded = 0, skipped = 0, failed = 0;
+    for (const p of players) {
+        const data = db.readPlayerData(p.wrId);
+        const url = data && data.avatar;
+        if (!url) { skipped++; continue; }
+        const existing = findAvatarLocal(p.wrId);
+        if (existing && index[p.wrId] === url) { skipped++; continue; } // 已缓存且未变
+
+        try {
+            const resp = await context.request.get(url, { timeout: 30000 });
+            if (!resp.ok()) throw new Error('HTTP ' + resp.status());
+            const buf = await resp.body();
+            const ct = (resp.headers()['content-type'] || '').toLowerCase();
+            const ext = ct.includes('png') ? '.png' : ct.includes('gif') ? '.gif'
+                : ct.includes('webp') ? '.webp' : '.jpg';
+            // 删除旧扩展名文件（URL 可能换了图片格式）
+            ['.jpg', '.jpeg', '.png', '.gif', '.webp'].forEach(e => {
+                const f = path.join(AV_DIR, p.wrId + e);
+                if (fs.existsSync(f) && e !== ext) fs.unlinkSync(f);
+            });
+            fs.writeFileSync(path.join(AV_DIR, p.wrId + ext), buf);
+            index[p.wrId] = url;
+            downloaded++;
+        } catch (e) {
+            failed++;
+            console.warn(`  ⚠ 头像下载失败 ${p.cnName}(wrId=${p.wrId}): ${e.message}`);
+        }
+        await sleep(200); // 礼貌间隔
+    }
+    fs.writeFileSync(INDEX_FILE, JSON.stringify(index, null, 2));
+    console.log(`头像: ${downloaded} 下载, ${skipped} 已缓存, ${failed} 失败`);
+}
+
+// 查找本地头像文件名（与 db.findAvatarFile 相同逻辑，本地独立实现避免依赖）
+function findAvatarLocal(wrId) {
+    const AV_DIR = path.join(DATA_DIR, 'avatars');
+    for (const ext of ['.jpg', '.jpeg', '.png', '.gif', '.webp']) {
+        if (fs.existsSync(path.join(AV_DIR, wrId + ext))) return wrId + ext;
+    }
+    return null;
+}
+
 // ---- 打包本地数据并上传 ----
 // wrIds 为 null 时上传全部本地选手；否则只上传指定选手（增量模式减小传输量）
 async function uploadToServer(server, token, wrIds = null) {
@@ -244,6 +297,19 @@ async function uploadToServer(server, token, wrIds = null) {
     });
     const metaFile = path.join(DATA_DIR, 'meta.json');
     if (fs.existsSync(metaFile)) payload.meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+
+    // 头像打包（base64；服务器写入 data/avatars/ 并经 /avatars 静态提供）
+    const AV_DIR = path.join(DATA_DIR, 'avatars');
+    payload.avatars = {};
+    if (fs.existsSync(AV_DIR)) {
+        fs.readdirSync(AV_DIR).forEach(f => {
+            const m = f.match(/^(\d+)(\.\w+)$/);
+            if (m && (!wanted || wanted.has(m[1]))) {
+                try { payload.avatars[m[1] + m[2]] = fs.readFileSync(path.join(AV_DIR, f)).toString('base64'); }
+                catch (e) { /* 读取失败跳过 */ }
+            }
+        });
+    }
 
     const sizeMB = (JSON.stringify(payload).length / 1024 / 1024).toFixed(2);
     console.log(`\n=== 上传数据到服务器 ===`);
@@ -285,6 +351,32 @@ async function main() {
     if (opts.wrIds.length > 0) {
         players = players.filter(p => opts.wrIds.includes(p.wrId));
         console.log(`测试模式：只同步 ${players.length} 个选手`);
+    }
+
+    // --avatars-only：只补头像（选手数据不重抓；头像 URL 取自本地已同步数据）
+    if (opts.avatarsOnly) {
+        console.log(`=== --avatars-only：下载 ${players.length} 个选手头像 ===`);
+        const { browser, context, launchedPid } = await attachChrome();
+        try {
+            const entry = await context.newPage();
+            try {
+                console.log('访问 eloboard.com 激活过盾状态…');
+                await entry.goto(ENTRY_URL, { waitUntil: 'domcontentloaded', timeout: 90000 });
+                await waitPassShield(entry, 90000);
+                console.log('✓ 过盾状态就绪');
+            } finally { await entry.close(); }
+            await downloadAvatars(context, players);
+        } finally {
+            await browser.close();
+            if (launchedPid) {
+                await sleep(1500);
+                killPidTree(launchedPid);
+                console.log('✓ 专用 Chrome 已关闭');
+            }
+        }
+        // 头像上传到服务器（uploadToServer 会连带打包本地选手数据）
+        await uploadToServer(config.server, config.token);
+        return;
     }
 
     // ---- 增量/全量选择 ----
@@ -338,6 +430,7 @@ async function main() {
 
         db.setFetcher(makeFetcher(context));
         await db.syncAll(players, { concurrency: 1, delay: 800, silent: false, full: isFull });
+        await downloadAvatars(context, players); // 同步完趁浏览器会话还在，下载头像
         syncOk = true;
     } finally {
         await browser.close(); // 只断开 CDP 连接

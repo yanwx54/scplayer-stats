@@ -27,6 +27,7 @@ Thumbs.db
 data/players/*.json
 data/meta.json
 data/upload-token.txt
+data/avatars/
 
 # 本地同步工具配置（含服务器地址和 token）
 local.config.json

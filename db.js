@@ -13,6 +13,7 @@ const DATA_DIR = path.join(__dirname, 'data');
 const PLAYERS_DIR = path.join(DATA_DIR, 'players');
 const META_FILE = path.join(DATA_DIR, 'meta.json');
 const H2H_DIR = path.join(DATA_DIR, 'h2h'); // 双人全量对战缓存（来自网页 storyb 详情）
+const AVATARS_DIR = path.join(DATA_DIR, 'avatars'); // 选手头像本地缓存（eloboard 外链被 Cloudflare 拦，需本地化）
 
 // 必须用 https：cf_clearance 是 Secure cookie，http 下不发送会被 Cloudflare 拦
 const BASE_URL = 'https://eloboard.com/men';
@@ -72,6 +73,16 @@ function winnerGain(elo) {
 function ensureDirs() {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
     if (!fs.existsSync(PLAYERS_DIR)) fs.mkdirSync(PLAYERS_DIR, { recursive: true });
+    if (!fs.existsSync(AVATARS_DIR)) fs.mkdirSync(AVATARS_DIR, { recursive: true });
+}
+
+// 查找选手本地头像文件，返回文件名（如 "38.jpg"）或 null
+function findAvatarFile(wrId) {
+    const exts = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+    for (const ext of exts) {
+        if (fs.existsSync(path.join(AVATARS_DIR, wrId + ext))) return wrId + ext;
+    }
+    return null;
 }
 
 // ---- Meta (last sync time etc.) ----
@@ -725,7 +736,10 @@ function computeH2H(wrId1, wrId2) {
         name: '', // server 端补充韩文名
         race: data.race || '',
         displayName: '',
-        image: data.avatar || '',
+        image: (() => { // 本地头像优先（eloboard 外链被 Cloudflare 拦截）
+            const f = findAvatarFile(wrId);
+            return f ? `/avatars/${f}` : (data.avatar || '');
+        })(),
         wrId,
         wins,
         winRate: fmtRate(wins, losses),
