@@ -217,46 +217,10 @@ async function handleSearch() {
     }
 }
 
-// 一键全量同步
+// 数据同步按钮：eloboard 已启用 Cloudflare 反爬，服务器端同步停用，数据由本地电脑自动推送
 async function handleSyncAll() {
-    if (syncBtn.disabled) return;
-    if (!confirm('全量同步所有选手数据，约需8分钟。期间可继续查询（旧数据）。确定开始？')) return;
-    syncBtn.disabled = true;
-    syncBtn.classList.add('syncing');
-    syncBtn.textContent = '同步中…';
-    try {
-        const r = await fetch('/api/sync-all').then(r => r.json());
-        if (r.ok) {
-            syncInfo.textContent = 'SYNC: 同步中…';
-            syncInfo.classList.remove('stale');
-            // 轮询状态，每30秒查一次，直到完成
-            const poll = setInterval(async () => {
-                try {
-                    const s = await fetch('/api/status').then(r => r.json());
-                    // 简单判断：lastFullSync 变新了就认为完成
-                    updateSyncDisplay(s.lastFullSync);
-                } catch {}
-            }, 30000);
-            // 8分钟后停止轮询并恢复按钮
-            setTimeout(() => {
-                clearInterval(poll);
-                syncBtn.disabled = false;
-                syncBtn.classList.remove('syncing');
-                syncBtn.textContent = '同步数据';
-                loadSyncStatus();
-            }, 8 * 60 * 1000);
-        } else {
-            alert(r.message || '同步已在进行中');
-            syncBtn.disabled = false;
-            syncBtn.classList.remove('syncing');
-            syncBtn.textContent = '同步数据';
-        }
-    } catch (e) {
-        alert('同步启动失败: ' + e.message);
-        syncBtn.disabled = false;
-        syncBtn.classList.remove('syncing');
-        syncBtn.textContent = '同步数据';
-    }
+    loadSyncStatus();
+    alert('数据源已启用反爬保护，网页端同步已停用。\n数据由本地电脑每天自动同步推送，如需立即更新请在本地运行 run-sync.bat。');
 }
 
 // 切换地图筛选时，只重渲染受影响的三个区块（H2H 表 / Intel 表 / 交战日志）

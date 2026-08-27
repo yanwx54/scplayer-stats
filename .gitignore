@@ -22,5 +22,17 @@ Thumbs.db
 # 临时文件
 *.tmp
 *.bak
-"data/players/*.json" 
-"data/meta.json" 
+
+# 运行时数据（本地/服务器各自独立维护，不入库）
+data/players/*.json
+data/meta.json
+data/upload-token.txt
+
+# 本地同步工具配置（含服务器地址和 token）
+local.config.json
+
+# Playwright 持久化浏览器配置目录
+.pw-profile/
+
+# 本地同步专用 Chrome profile（含过盾 cookie）
+.sync-chrome/

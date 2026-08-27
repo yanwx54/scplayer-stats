@@ -14,7 +14,8 @@ const PLAYERS_DIR = path.join(DATA_DIR, 'players');
 const META_FILE = path.join(DATA_DIR, 'meta.json');
 const H2H_DIR = path.join(DATA_DIR, 'h2h'); // 双人全量对战缓存（来自网页 storyb 详情）
 
-const BASE_URL = 'http://eloboard.com/men';
+// 必须用 https：cf_clearance 是 Secure cookie，http 下不发送会被 Cloudflare 拦
+const BASE_URL = 'https://eloboard.com/men';
 const PLAYER_PAGE_URL = (wrId) => `${BASE_URL}/bbs/board.php?bo_table=bj_list&wr_id=${wrId}`;
 
 const headers = {
@@ -92,10 +93,18 @@ function readPlayerData(wrId) {
     catch { return null; }
 }
 
+// ---- HTML 抓取器（默认 axios；本地过盾同步时注入 Playwright 抓取器）----
+let fetchHtml = async (url) => {
+    const response = await axios.get(url, { headers, timeout: 45000 });
+    return response.data;
+};
+// 注入自定义抓取器：fn(url) => html 字符串
+function setFetcher(fn) { fetchHtml = fn; }
+
 // ---- Fetch + parse a player's page from eloboard ----
 async function fetchAndParsePlayer(wrId, opts = {}) {
-    const response = await axios.get(PLAYER_PAGE_URL(wrId), { headers, timeout: 45000 });
-    const $ = cheerio.load(response.data);
+    const html = await fetchHtml(PLAYER_PAGE_URL(wrId));
+    const $ = cheerio.load(html);
 
     // extract race from 주종 row + current ELO
     let race = '';
@@ -326,7 +335,7 @@ async function syncAll(players, opts = {}) {
     }
 
     const meta = readMeta();
-    meta.lastFullSync = new Date().toISOString();
+    if (opts.full !== false) meta.lastFullSync = new Date().toISOString(); // 增量模式不覆盖全量时间
     writeMeta(meta);
 
     console.log(`\n同步完成: ${players.length - failed.length}/${players.length} 成功, ${failed.length} 失败`);
@@ -697,8 +706,8 @@ function h2hCacheFile(wrId1, wrId2) {
 // 抓取某选手主页 board 1 里 vs oppWrId 的 storyb 详情
 // 返回数组：[{date, mapName, viewerWon, eloChange, format, memo}]
 async function fetchStoryMatches(viewerWrId, oppWrId) {
-    const response = await axios.get(PLAYER_PAGE_URL(viewerWrId), { headers, timeout: 45000 });
-    const $ = cheerio.load(response.data);
+    const html = await fetchHtml(PLAYER_PAGE_URL(viewerWrId));
+    const $ = cheerio.load(html);
     const boards = $('.list-board');
     if (boards.length < 2) return [];
     const b1 = $(boards[1]);
@@ -843,6 +852,7 @@ module.exports = {
     savePlayerData,
     syncPlayer,
     syncAll,
+    setFetcher,
     computeMapStats,
     computeRecentMatches,
     computeH2H,

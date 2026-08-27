@@ -21,5 +21,9 @@
     "axios": "^1.6.8",
     "cheerio": "1.0.0-rc.12",
     "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "patchright": "^1.62.1",
+    "playwright": "^1.62.1"
   }
 }

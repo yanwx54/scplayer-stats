@@ -76,32 +76,48 @@ app.get('/api/status', (req, res) => {
     res.json(db.getStats());
 });
 
-// ---- API: sync a single player on demand (background refresh) ----
-app.get('/api/sync-player', async (req, res) => {
-    try {
-        const { wrId } = req.query;
-        if (!wrId) return res.status(400).json({ error: 'wrId required' });
-        await db.syncPlayer(wrId, { silent: true });
-        res.json({ ok: true, wrId, ...db.getStats() });
-    } catch (e) {
-        res.status(500).json({ error: 'sync failed', detail: e.message });
-    }
+// ---- API: sync a single player on demand ----
+// eloboard 已启用 Cloudflare 反爬，服务器端直抓不可用；数据由本地 local-sync.js 过盾抓取后推送
+app.get('/api/sync-player', (req, res) => {
+    res.json({ ok: false, message: '数据源已启用反爬保护，服务器端同步已停用（数据由本地电脑自动同步推送）' });
 });
 
-// ---- API: full sync all players (triggered by sync button) ----
-let syncAllRunning = false;
-app.get('/api/sync-all', async (req, res) => {
-    if (syncAllRunning) return res.json({ ok: false, message: '同步进行中', ...db.getStats() });
-    syncAllRunning = true;
-    res.json({ ok: true, message: '全量同步已启动（后台运行，约8分钟）', ...db.getStats() });
-    try {
-        const players = parsePlayersFromMd();
-        await db.syncAll(players, { concurrency: 4, delay: 1000, silent: true });
-    } catch (e) {
-        console.error('全量同步出错:', e.message);
-    } finally {
-        syncAllRunning = false;
+// ---- API: full sync all players ----
+app.get('/api/sync-all', (req, res) => {
+    res.json({ ok: false, message: '数据源已启用反爬保护，服务器端同步已停用（数据由本地电脑自动同步推送）' });
+});
+
+// ---- API: 本地同步工具数据上传（Bearer token 认证）----
+// token 存于 data/upload-token.txt（不入 git），本地 local.config.json 配同一 token
+const UPLOAD_TOKEN_FILE = path.join(__dirname, 'data', 'upload-token.txt');
+let UPLOAD_TOKEN = null;
+try { UPLOAD_TOKEN = fs.readFileSync(UPLOAD_TOKEN_FILE, 'utf8').trim() || null; } catch (e) {}
+if (!UPLOAD_TOKEN) console.log('⚠ 未配置上传 token（data/upload-token.txt），/api/upload-data 不可用');
+
+function atomicWrite(file, content) {
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, content);
+    fs.renameSync(tmp, file);
+}
+
+app.post('/api/upload-data', express.json({ limit: '30mb' }), (req, res) => {
+    if (!UPLOAD_TOKEN) return res.status(503).json({ error: '上传未启用：请在服务器创建 data/upload-token.txt' });
+    const auth = req.headers.authorization || '';
+    if (auth !== 'Bearer ' + UPLOAD_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+    const { meta, players } = req.body || {};
+    if (!players || typeof players !== 'object') return res.status(400).json({ error: 'players required' });
+
+    const playersDir = path.join(__dirname, 'data', 'players');
+    fs.mkdirSync(playersDir, { recursive: true });
+    let count = 0;
+    for (const [wrId, data] of Object.entries(players)) {
+        if (!/^\d+$/.test(wrId) || !data) continue; // wrId 只允许纯数字，防路径注入
+        atomicWrite(path.join(playersDir, wrId + '.json'), JSON.stringify(data));
+        count++;
     }
+    if (meta) atomicWrite(path.join(__dirname, 'data', 'meta.json'), JSON.stringify(meta, null, 2));
+    console.log(`[upload] 收到并写入 ${count} 个选手数据`);
+    res.json({ ok: true, playersWritten: count });
 });
 
 // ---- API: head-to-head (local-first, remote fallback) ----
