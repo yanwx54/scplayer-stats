@@ -277,13 +277,64 @@ function savePlayerData(wrId, data) {
     fs.writeFileSync(file, JSON.stringify(data));
 }
 
-// ---- Sync one player (full re-fetch, with retry) ----
+// ---- 增量合并：页面解析结果 与 本地既有数据 合并 ----
+// 语义：本地库只增不减 —
+//   1. 页面上出现的比赛（当前 3 个月窗口）取页面最新值
+//   2. 本地有而页面上没有的（已滚出网页窗口的历史）继续保留
+//   3. 新比赛（页面上有、本地没有的）追加
+// 去重键：日期+对手+地图+赛制+胜负；同键多条按数量对账（同日同对手同图多场不误删）
+function mergePlayerData(existing, fresh) {
+    if (!existing || !Array.isArray(existing.matches) || existing.matches.length === 0) {
+        return { data: fresh, newCount: fresh.matches.length }; // 首次抓取：整页入库
+    }
+    const keyOf = (m) => `${m.date}|${m.oppWrId || ''}|${m.mapKr || m.mapName}|${m.format}|${m.isWin ? 'W' : 'L'}`;
+
+    // 页面比赛的键计数
+    const freshCount = {};
+    fresh.matches.forEach(m => { const k = keyOf(m); freshCount[k] = (freshCount[k] || 0) + 1; });
+
+    // 本地比赛逐条对账：页面上还有的 → 由页面版本替代；页面上没有的 → 保留为历史
+    const consumed = {};
+    const history = [];
+    existing.matches.forEach(m => {
+        const k = keyOf(m);
+        const used = consumed[k] || 0;
+        if (used < (freshCount[k] || 0)) {
+            consumed[k] = used + 1;
+        } else {
+            history.push(m);
+        }
+    });
+
+    // 新增数 = 页面总数 − 本地被对账匹配到的数量
+    const matched = existing.matches.length - history.length;
+    const newCount = Math.max(0, fresh.matches.length - matched);
+
+    const merged = fresh.matches.concat(history);
+    merged.sort((a, b) => (a.date < b.date ? 1 : (a.date > b.date ? -1 : 0)));
+
+    // 元数据（race/elo/avatar/storyByOpp/mapStats）取页面最新值，比赛记录为合并结果
+    const data = Object.assign({}, fresh, { matches: merged, matchCount: merged.length });
+
+    // 防回退：页面截断/异常解析导致字段为空时，保留本地已有值（下次好抓取自动覆盖）
+    ['race', 'elo', 'avatar', 'storyByOpp', 'mapStats'].forEach((k) => {
+        const v = data[k];
+        const isEmpty = v == null || v === '' ||
+            (typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 0);
+        if (isEmpty && existing[k]) data[k] = existing[k];
+    });
+
+    return { data, newCount };
+}
+
+// ---- Sync one player (fetch + incremental merge, with retry) ----
 async function syncPlayer(wrId, opts = {}) {
     const retries = opts.retries || 0;
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
-            const data = await fetchAndParsePlayer(wrId, opts);
+            const fresh = await fetchAndParsePlayer(wrId, opts);
+            const { data, newCount } = mergePlayerData(readPlayerData(wrId), fresh);
             savePlayerData(wrId, data);
 
             const meta = readMeta();
@@ -291,7 +342,8 @@ async function syncPlayer(wrId, opts = {}) {
             meta.playerSync[wrId] = { time: new Date().toISOString(), matchCount: data.matchCount };
             writeMeta(meta);
 
-            if (!opts.silent) console.log(`  ✓ wrId=${wrId} race=${data.race} matches=${data.matchCount}`);
+            if (!opts.silent) console.log(`  ✓ wrId=${wrId} race=${data.race} matches=${data.matchCount}${newCount > 0 ? ` (+${newCount}新)` : ''}`);
+            data._newCount = newCount; // 仅供调用方日志用，不入库
             return data;
         } catch (e) {
             lastErr = e;
@@ -323,7 +375,8 @@ async function syncAll(players, opts = {}) {
             const p = batch[idx];
             done++;
             if (r.status === 'fulfilled') {
-                console.log(`  [${done}/${players.length}] ✓ ${p.cnName}(${p.krName}) wrId=${p.wrId} race=${r.value.race} matches=${r.value.matchCount}`);
+                const nc = r.value._newCount || 0;
+                console.log(`  [${done}/${players.length}] ✓ ${p.cnName}(${p.krName}) wrId=${p.wrId} race=${r.value.race} matches=${r.value.matchCount}${nc > 0 ? ` (+${nc}新)` : ''}`);
             } else {
                 console.log(`  [${done}/${players.length}] ✗ ${p.cnName}(${p.krName}) wrId=${p.wrId} ERROR: ${r.reason.message}`);
                 failed.push({ player: p, error: r.reason.message });
@@ -850,6 +903,7 @@ module.exports = {
     readPlayerData,
     fetchAndParsePlayer,
     savePlayerData,
+    mergePlayerData,
     syncPlayer,
     syncAll,
     setFetcher,

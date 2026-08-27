@@ -7,7 +7,8 @@
  *       在真人浏览器环境内抓取全部选手页面，数据写入本地 data/ 后推送到服务器。
  *
  * 用法：
- *   node local-sync.js               # 增量同步（默认）：只同步近 14 天有比赛的活跃选手
+ *   node local-sync.js               # 增量同步（默认）：只抓近 14 天有比赛的活跃选手，
+ *                                     #   新比赛追加进本地库（历史永久保留，不丢滚出网页窗口的比赛）
  *   node local-sync.js --full        # 全量同步全部选手（距上次全量超 7 天也会自动全量）
  *   node local-sync.js 12 33         # 只同步指定 wrId（测试用）
  *   node local-sync.js --no-upload   # 只同步不上传
@@ -196,6 +197,7 @@ async function waitPassShield(page, timeoutMs = 60000) {
 }
 
 // ---- 用浏览器会话构造 HTML 抓取器（注入 db，替代 axios）----
+// 选手页约 7MB，必须等完全加载（domcontentloaded 时 DOM 可能仍在流式填充）
 function makeFetcher(context) {
     return async (url) => {
         const page = await context.newPage();
@@ -208,12 +210,15 @@ function makeFetcher(context) {
                 if (!ok) throw new Error(`盾等待超时: ${url}`);
                 await page.waitForTimeout(2000); // 挑战通过后页面自动刷新，等渲染
             }
-            await page.waitForTimeout(1200); // 内容渲染缓冲
+            // 等网络空闲（大页面完全加载），广告脚本导致空闲检测失灵时 30s 兜底
+            await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+            await page.waitForTimeout(1500);
             let html = await page.content();
             // 若拿到的仍是盾页（标题未识别的变体），重新导航再等一次
             if (SHIELD_HTML_RE.test(html)) {
                 await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
                 if (!(await waitPassShield(page, 90000))) throw new Error(`盾重试超时: ${url}`);
+                await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
                 await page.waitForTimeout(2000);
                 html = await page.content();
                 if (SHIELD_HTML_RE.test(html)) throw new Error(`盾未通过: ${url}`);
