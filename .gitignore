@@ -28,6 +28,11 @@ data/players/*.json
 data/meta.json
 data/upload-token.txt
 data/avatars/
+data/player-id-map.json
+data/players-backup-*/
+
+# 诊断产物（迁移调试用，可随时重建/删除）
+diag-*
 
 # 本地同步工具配置（含服务器地址和 token）
 local.config.json

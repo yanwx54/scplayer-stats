@@ -1,21 +1,24 @@
 /**
- * local-sync.js — 附着日常 Chrome 过盾全量同步 + 推送服务器
+ * local-sync.js — 附着日常 Chrome 过盾 API 同步 + 推送服务器
  *
  * 背景：eloboard.com 启用 Cloudflare Turnstile 反爬，服务器和自动化浏览器均被拦，
  *       但日常使用的真实 Chrome（真人环境信誉）可自动过盾。
- * 方案：附着到用户正在运行的 Chrome（需带 --remote-debugging-port=9222 启动），
- *       在真人浏览器环境内抓取全部选手页面，数据写入本地 data/ 后推送到服务器。
+ *       2026-08 网站改版：旧 HTML 选手页废弃，改为 JSON API（/api/players、/api/matches）。
+ * 方案：附着到专用 Chrome（CDP 9222），在过盾浏览器会话内调用新版 API 抓取
+ *       全部选手数据，写入本地 data/ 后推送到服务器。
  *
  * 用法：
  *   node local-sync.js               # 增量同步（默认）：只抓近 14 天有比赛的活跃选手，
- *                                     #   新比赛追加进本地库（历史永久保留，不丢滚出网页窗口的比赛）
+ *                                     #   新比赛追加进本地库（历史永久保留，不丢滚出窗口的比赛）
  *   node local-sync.js --full        # 全量同步全部选手（距上次全量超 7 天也会自动全量）
  *   node local-sync.js 12 33         # 只同步指定 wrId（测试用）
  *   node local-sync.js --no-upload   # 只同步不上传
  *   node local-sync.js --upload-only # 跳过抓取，直接推送本地已有数据（服务器可达后补传）
  *   node local-sync.js --avatars-only # 只下载选手头像（eloboard 外链被拦，头像本地化）
+ *   node local-sync.js --rebuild-id-map # 重建 旧wrId→新playerId 映射（MD 列表变动后运行；
+ *                                     #   映射文件缺失时同步前也会自动重建）
  *
- * 依赖：npm i -D playwright
+ * 依赖：npm i -D patchright（或 playwright）
  * 前置：无需手动操作 — 若 9222 调试端口未开放，脚本自动以独立 profile
  *       （.sync-chrome/）启动专用 Chrome，过盾 cookie 持久化在 profile 中，
  *       同步结束后自动关闭该实例，不影响日常浏览器。
@@ -61,6 +64,7 @@ function parseArgs() {
         noUpload: args.includes('--no-upload'),
         uploadOnly: args.includes('--upload-only'), // 跳过抓取，直接推送本地已有数据
         avatarsOnly: args.includes('--avatars-only'), // 只下载头像（不重抓比赛数据）
+        rebuildIdMap: args.includes('--rebuild-id-map'), // 重建旧wrId→新playerId映射
         full: args.includes('--full'),              // 强制全量（默认增量：只同步活跃选手）
     };
 }
@@ -131,6 +135,40 @@ function killPidTree(pid) {
     try { execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' }); } catch (e) { /* 已退出 */ }
 }
 
+// 从任务栏隐藏同步 Chrome：给窗口加 WS_EX_TOOLWINDOW 扩展样式（任务栏/Alt-Tab 均不显示）
+// 窗口本体仍在屏幕外且保持 visible（不最小化、不 SW_HIDE），页面渲染与过盾行为完全不变
+// 只匹配命令行含 sync-chrome 的进程，绝不影响用户自己打开的 Chrome
+function hideSyncChromeWindows() {
+    const ps = `
+$ProgressPreference = 'SilentlyContinue'
+$sig = '[DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i); [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v); [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);'
+Add-Type -MemberDefinition $sig -Name U -Namespace W
+$styled = 0
+$deadline = (Get-Date).AddSeconds(15)
+while ((Get-Date) -lt $deadline) {
+  $styled = 0
+  Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like '*sync-chrome*' } | ForEach-Object {
+    $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+    if ($p -and $p.MainWindowHandle -ne 0) {
+      $h = $p.MainWindowHandle
+      $ex = [W.U]::GetWindowLong($h, -20)
+      if (($ex -band 0x80) -eq 0) {
+        [void][W.U]::SetWindowLong($h, -20, ($ex -bor 0x80))
+        [void][W.U]::SetWindowPos($h, [IntPtr]::Zero, 0, 0, 0, 0, 0x33)
+      }
+      $styled++
+    }
+  }
+  if ($styled -gt 0) { break }
+  Start-Sleep -Milliseconds 400
+}
+Write-Output $styled`;
+    const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+    try {
+        return parseInt(execSync(`powershell -NoProfile -EncodedCommand ${encoded}`).toString().trim()) || 0;
+    } catch (e) { return 0; }
+}
+
 // ---- 附着 Chrome（CDP），返回 context ----
 // 端口未开放时自动启动专用 Chrome；返回 launchedPid（非 null 表示由本脚本启动，需在结束时关闭）
 async function attachChrome() {
@@ -156,6 +194,8 @@ async function attachChrome() {
         }
         console.log(`调试端口未开放，自动启动专用 Chrome（独立 profile）…`);
         launchedPid = launchSyncChrome(chromePath);
+        // 窗口创建后立即从任务栏隐藏（内部轮询等窗口出现，最多 15s）
+        if (hideSyncChromeWindows() > 0) console.log('✓ Chrome 已隐藏（屏幕外，任务栏不显示）');
         for (let i = 0; i < 30 && !version; i++) {
             await sleep(1000);
             version = await cdpVersion(1500);
@@ -183,8 +223,6 @@ async function attachChrome() {
 // ---- 等待页面通过 Cloudflare 盾（无交互 managed challenge 自动过）----
 // 盾页标题各语言版本：Just a moment… / 잠시만… / 请稍候… / Verifying…
 const SHIELD_TITLE_RE = /just a moment|잠시만|请稍候|安全验证|security check|checking your browser|verifying|attention required/i;
-// 盾页正文特征（HTML 兜底检测）
-const SHIELD_HTML_RE = /just a moment|잠시만|请稍候|安全验证|verifying you are human|attention required|cf-challenge/i;
 
 async function waitPassShield(page, timeoutMs = 60000) {
     try {
@@ -198,38 +236,67 @@ async function waitPassShield(page, timeoutMs = 60000) {
     }
 }
 
-// ---- 用浏览器会话构造 HTML 抓取器（注入 db，替代 axios）----
-// 选手页约 7MB，必须等完全加载（domcontentloaded 时 DOM 可能仍在流式填充）
-function makeFetcher(context) {
+// ---- 用浏览器会话构造 JSON API 抓取器（注入 db，替代 axios 直连）----
+// context.request 自带过盾 cookie（cf_clearance），API 请求无需打开页面
+function makeApiFetcher(context) {
     return async (url) => {
-        const page = await context.newPage();
-        try {
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-            // 弹盾时等待自动通过（managed challenge 通常 5~30 秒自动完成并刷新页面）
-            const title = await page.title().catch(() => '');
-            if (SHIELD_TITLE_RE.test(title)) {
-                const ok = await waitPassShield(page, 90000);
-                if (!ok) throw new Error(`盾等待超时: ${url}`);
-                await page.waitForTimeout(2000); // 挑战通过后页面自动刷新，等渲染
-            }
-            // 等网络空闲（大页面完全加载），广告脚本导致空闲检测失灵时 30s 兜底
-            await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
-            await page.waitForTimeout(1500);
-            let html = await page.content();
-            // 若拿到的仍是盾页（标题未识别的变体），重新导航再等一次
-            if (SHIELD_HTML_RE.test(html)) {
-                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-                if (!(await waitPassShield(page, 90000))) throw new Error(`盾重试超时: ${url}`);
-                await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
-                await page.waitForTimeout(2000);
-                html = await page.content();
-                if (SHIELD_HTML_RE.test(html)) throw new Error(`盾未通过: ${url}`);
-            }
-            return html;
-        } finally {
-            await page.close();
-        }
+        const r = await context.request.get(url, { timeout: 30000 });
+        if (!r.ok()) throw new Error(`HTTP ${r.status()}: ${url}`);
+        const text = await r.text();
+        try { return JSON.parse(text); }
+        catch (e) { throw new Error(`非 JSON 响应(${String(text).slice(0, 80)}): ${url}`); }
     };
+}
+
+// ---- 重建 旧wrId → 新playerId 映射（全量枚举新站选手，按韩文名匹配 MD 列表）----
+// 输出 data/player-id-map.json；同名选手取 games 最多者
+async function rebuildIdMap(context, players) {
+    console.log('=== 重建 ID 映射（全量枚举新站选手）===');
+    const all = [];
+    let offset = 0;
+    const LIMIT = 200;
+    while (true) {
+        const r = await context.request.get(`https://eloboard.com/api/players?limit=${LIMIT}&offset=${offset}`, { timeout: 30000 });
+        if (!r.ok()) throw new Error(`HTTP ${r.status()}`);
+        let arr;
+        try { arr = JSON.parse(await r.text()); } catch (e) { throw new Error('选手列表非 JSON 响应'); }
+        if (!Array.isArray(arr) || arr.length === 0) break;
+        all.push(...arr);
+        process.stdout.write(`\r已拉取 ${all.length}`);
+        offset += arr.length;
+        if (arr.length < LIMIT) break;
+        await sleep(250);
+    }
+    const men = all.filter(p => p.division === 'men');
+    console.log(`\n新站共 ${all.length} 名选手（men=${men.length}）`);
+
+    // 韩文名 → 新 id（同名取 games 最多）
+    const byName = {};
+    men.forEach(p => { if (!byName[p.name] || (p.games || 0) > (byName[p.name].games || 0)) byName[p.name] = p; });
+
+    const map = {}, byNewId = {}, missing = [];
+    for (const p of players) {
+        if (!p.wrId) { missing.push(p.cnName + '(无wrId)'); continue; }
+        const found = byName[p.krName];
+        if (found) {
+            map[p.wrId] = found.id;
+            byNewId[found.id] = p.wrId;
+        } else {
+            missing.push(`${p.cnName}(${p.krName})`);
+        }
+    }
+    const file = path.join(__dirname, 'data', 'player-id-map.json');
+    fs.writeFileSync(file, JSON.stringify({
+        builtAt: new Date().toISOString(),
+        totalPlayers: all.length,
+        oldToNew: map, newToOld: byNewId,
+    }, null, 2));
+    db.clearIdMapCache();
+
+    const changed = Object.entries(map).filter(([o, n]) => Number(o) !== n);
+    console.log(`映射 ${Object.keys(map).length}/${players.length}（ID 相同 ${Object.keys(map).length - changed.length}，变化 ${changed.length}）`);
+    if (missing.length) console.log(`⚠ 未匹配: ${missing.join(', ')}`);
+    return Object.keys(map).length;
 }
 
 // ---- 下载选手头像到本地（eloboard 外链被 Cloudflare 拦，必须本地化）----
@@ -428,7 +495,16 @@ async function main() {
             await entry.close();
         }
 
-        db.setFetcher(makeFetcher(context));
+        db.setFetcher(makeApiFetcher(context));
+
+        // ID 映射缺失或 --rebuild-id-map 时，同步前先重建映射
+        const idMapFile = path.join(__dirname, 'data', 'player-id-map.json');
+        let hasIdMap = false;
+        try { hasIdMap = !!JSON.parse(fs.readFileSync(idMapFile, 'utf8')).oldToNew; } catch (e) {}
+        if (!hasIdMap || opts.rebuildIdMap) {
+            if (!opts.rebuildIdMap) console.log('⚠ 缺少 ID 映射文件，自动重建…');
+            await rebuildIdMap(context, players);
+        }
         await db.syncAll(players, { concurrency: 1, delay: 800, silent: false, full: isFull });
         await downloadAvatars(context, players); // 同步完趁浏览器会话还在，下载头像
         syncOk = true;

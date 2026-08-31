@@ -7,25 +7,19 @@
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
-const cheerio = require('cheerio');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const PLAYERS_DIR = path.join(DATA_DIR, 'players');
 const META_FILE = path.join(DATA_DIR, 'meta.json');
-const H2H_DIR = path.join(DATA_DIR, 'h2h'); // 双人全量对战缓存（来自网页 storyb 详情）
 const AVATARS_DIR = path.join(DATA_DIR, 'avatars'); // 选手头像本地缓存（eloboard 外链被 Cloudflare 拦，需本地化）
 
-// 必须用 https：cf_clearance 是 Secure cookie，http 下不发送会被 Cloudflare 拦
-const BASE_URL = 'https://eloboard.com/men';
-const PLAYER_PAGE_URL = (wrId) => `${BASE_URL}/bbs/board.php?bo_table=bj_list&wr_id=${wrId}`;
-
-const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-};
-
-const RACE_FULL = { Terran: 'T', Zerg: 'Z', Protoss: 'P' };
+// ---- eloboard 新版 API（2026-08 改版：旧 HTML 页面已废弃，改用 JSON API）----
+const API_BASE = 'https://eloboard.com/api';
+const AVATAR_BASE = 'https://eloboard.co.kr/static/'; // thumb_url 为相对路径 players/{id}.jpg
+const ID_MAP_FILE = path.join(DATA_DIR, 'player-id-map.json'); // 旧wrId ↔ 新playerId 映射
+const MATCH_WINDOW_DAYS = 120;  // 每次同步拉取的比赛深度（UI 需要 90 天，留余量）
+const PAGE_LIMIT = 200;         // /api/matches 单页上限
+const MAX_PAGES = 30;           // 单选手分页安全上限（30×200=6000 场，远超 120 天量）
 
 // ---- Season maps (shared with server) ----
 const MAPS_JSON = path.join(__dirname, 'public', 'maps.json');
@@ -41,11 +35,6 @@ function matchSeasonMap(mapName) {
         const b = normalize(m.kr);
         return a === b || a.includes(b);
     }) || null;
-}
-
-function extractOpponentRace(cellText) {
-    const m = cellText.match(/\(([TZP])\)/);
-    return m ? m[1] : '';
 }
 
 // ELO 变化取反：eloChange 是 wrId1 视角的字符串（如 "+22.2"/"-10.0"），
@@ -104,182 +93,114 @@ function readPlayerData(wrId) {
     catch { return null; }
 }
 
-// ---- HTML 抓取器（默认 axios；本地过盾同步时注入 Playwright 抓取器）----
-let fetchHtml = async (url) => {
-    const response = await axios.get(url, { headers, timeout: 45000 });
+// ---- API 抓取器（默认 axios 直连，会被 Cloudflare 拦；本地过盾同步时注入浏览器会话抓取器）----
+let apiGet = async (url) => {
+    const response = await axios.get(url, { timeout: 45000 });
     return response.data;
 };
-// 注入自定义抓取器：fn(url) => html 字符串
-function setFetcher(fn) { fetchHtml = fn; }
+// 注入自定义抓取器：fn(url) => 解析后的 JSON（local-sync 注入 Playwright context.request）
+function setFetcher(fn) { apiGet = fn; }
 
-// ---- Fetch + parse a player's page from eloboard ----
+// ---- ID 映射（旧 wrId ↔ 新 player_id，由 local-sync --rebuild-id-map 生成）----
+let idMapCache = null;
+function loadIdMap() {
+    if (idMapCache) return idMapCache;
+    try {
+        idMapCache = JSON.parse(fs.readFileSync(ID_MAP_FILE, 'utf8'));
+    } catch (e) {
+        idMapCache = null;
+    }
+    return idMapCache;
+}
+function clearIdMapCache() { idMapCache = null; }
+
+// 对手 player_id → 本地 oppWrId：
+//   跟踪选手 → 旧 wrId（H2H/去重 与既有数据对齐）
+//   非跟踪选手 → 'n' + 新 id（前缀避免与旧 wrId 数字空间冲突）
+function oppIdToLocal(newId) {
+    const map = loadIdMap();
+    const old = map && map.newToOld && map.newToOld[String(newId)];
+    return old != null ? String(old) : 'n' + newId;
+}
+
+function fmtElo(eloRaw) {
+    const n = parseFloat(eloRaw);
+    if (isNaN(n)) return '';
+    return n.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+}
+
+// API 比赛记录 → 本地格式（viewer = 选手本人视角）
+function convertApiMatch(m, myNewId) {
+    const me = (m.participants || []).find(p => p.player_id === myNewId);
+    const opp = (m.participants || []).find(p => p.player_id !== myNewId);
+    const isWin = !!me && me.result === 'win';
+    const matched = matchSeasonMap(m.map_name);
+    // elo_delta 恒为胜方增益（正数）；本地约定为本人视角带符号字符串
+    let eloChange = '';
+    if (m.elo_delta != null && !isNaN(parseFloat(m.elo_delta))) {
+        const d = parseFloat(m.elo_delta);
+        eloChange = (isWin ? '+' : '-') + Math.abs(d).toFixed(1);
+    }
+    let memo = m.memo || '';
+    if (!memo && (m.event_name || m.round_label)) {
+        memo = [m.event_name, m.round_label].filter(Boolean).join(' ');
+    }
+    return {
+        date: m.played_on || '',
+        oppWrId: opp ? oppIdToLocal(opp.player_id) : null,
+        oppRace: opp ? (opp.race || '') : '',
+        mapName: m.map_name || '',
+        mapKr: matched ? matched.kr : '',
+        mapCn: matched ? matched.cn : '',
+        isSeasonMap: !!matched,
+        isWin,
+        eloChange,
+        format: m.format_raw || '',
+        memo,
+    };
+}
+
+// ---- 拉取并解析一名选手（新版 API：选手详情 + 比赛分页）----
 async function fetchAndParsePlayer(wrId, opts = {}) {
-    const html = await fetchHtml(PLAYER_PAGE_URL(wrId));
-    const $ = cheerio.load(html);
+    const map = loadIdMap();
+    if (!map || !map.oldToNew || map.oldToNew[wrId] == null) {
+        throw new Error(`缺少新站 ID 映射（wrId=${wrId}），请先运行 node local-sync.js --rebuild-id-map`);
+    }
+    const newId = map.oldToNew[wrId];
 
-    // extract race from 주종 row + current ELO
-    let race = '';
-    let elo = '';
-    $('th').each((i, el) => {
-        if (race && elo) return;
-        const label = $(el).text().trim();
-        if (label === '주종' && !race) {
-            const val = $(el).next('td').text().trim();
-            race = RACE_FULL[val] || '';
-        } else if (label === 'ELO' && !elo) {
-            elo = $(el).next('td').text().trim();
-        }
-    });
+    // 选手详情：种族 / 当前 ELO / 头像
+    const info = await apiGet(`${API_BASE}/players/${newId}`);
+    if (!info || !info.id) throw new Error(`选手详情响应异常（wrId=${wrId}, newId=${newId}）`);
 
-    // extract avatar: 页面顶部选手信息卡的第一张 w=120 头像图
-    let avatar = '';
-    $('img[width="120"]').each((i, el) => {
-        if (avatar) return;
-        avatar = $(el).attr('src') || '';
-    });
-
-    // extract all match rows
-    // 页面有多个 .list-board，比赛数据所在的那个不确定（不同选手 index 不同），
-    // 遍历所有 .list-board，取含比赛数据行（td style 含 #0cf 胜/#434348 负）的那个
+    // 比赛列表：分页拉取，直到越过窗口或翻完
+    const cutoff = new Date(Date.now() - MATCH_WINDOW_DAYS * 86400000).toISOString().slice(0, 10);
     const matches = [];
-    let matchRows = null;
-    $('.list-board').each((i, el) => {
-        if (matchRows) return; // 已找到则跳过
-        const trs = $(el).find('table tbody tr');
-        trs.each((j, tr) => {
-            if (matchRows) return;
-            const firstTdStyle = ($(tr).find('td').first().attr('style') || '').toLowerCase();
-            if (firstTdStyle.includes('#0cf') || firstTdStyle.includes('#434348')) {
-                matchRows = trs;
-            }
-        });
-    });
-
-    if (matchRows) {
-        matchRows.each((i, el) => {
-            const tds = $(el).find('td');
-            if (tds.length < 3) return;
-            const bgStyle = ($(tds[0]).attr('style') || '').toLowerCase();
-            const isWin = bgStyle.includes('#0cf');
-            const isLoss = bgStyle.includes('#434348');
-            if (!isWin && !isLoss) return;
-
-        const dateText = $(tds[0]).text().trim();
-        const dateMatch = dateText.match(/\d{4}-\d{2}-\d{2}/);
-        const date = dateMatch ? dateMatch[0] : '';
-
-        const oppCell = $(tds[1]);
-        const oppText = oppCell.text().trim();
-        const oppHref = oppCell.find('a').attr('href') || '';
-        const oppWrIdMatch = oppHref.match(/wr_id=(\d+)/);
-        const oppRace = extractOpponentRace(oppText);
-
-        const mapName = $(tds[2]).text().trim();
-        const matched = matchSeasonMap(mapName);
-
-        const eloChange = (tds[3] ? $(tds[3]).text().trim() : '') || '';
-        const format = (tds[4] ? $(tds[4]).text().trim() : '') || '';
-        const memo = (tds[5] ? $(tds[5]).text().trim() : '') || '';
-
-        matches.push({
-            date,
-            oppWrId: oppWrIdMatch ? oppWrIdMatch[1] : null,
-            oppRace,
-            mapName,
-            mapKr: matched ? matched.kr : '',
-            mapCn: matched ? matched.cn : '',
-            isSeasonMap: !!matched,
-            isWin,
-            eloChange,
-            format,
-            memo,
-        });
-    });
+    for (let page = 0; page < MAX_PAGES; page++) {
+        const offset = page * PAGE_LIMIT;
+        const arr = await apiGet(`${API_BASE}/matches?player_id=${newId}&limit=${PAGE_LIMIT}&offset=${offset}`);
+        if (!Array.isArray(arr)) throw new Error(`比赛列表响应异常（wrId=${wrId}, offset=${offset}）`);
+        for (const m of arr) {
+            if (m.played_on && m.played_on < cutoff) continue; // 窗口外（页内跨界部分）
+            matches.push(convertApiMatch(m, newId));
+        }
+        if (arr.length < PAGE_LIMIT) break;       // 翻完
+        if (arr[arr.length - 1].played_on < cutoff) break; // 最老一条已越界
+        await new Promise(r => setTimeout(r, 200)); // 分页间礼貌间隔
     }
 
-    // 解析对手汇总 board 的 storyb 全量对战（vs 每个对手的生涯完整记录）
-    // board 1 每行 td[5] 有 moreb{N} id，对应 #storyb{N} 内嵌套 table
-    // 一次页面请求即可拿到该选手 vs 所有对手的全量对战，无需额外 HTTP 请求
-    const storyByOpp = {};
-    $('.list-board').each((i, el) => {
-        $(el).find('table tbody tr').each((j, tr) => {
-            const link = $(tr).find('a[href*="wr_id="]').first();
-            if (!link.length) return;
-            const href = link.attr('href') || '';
-            const oppMatch = href.match(/wr_id=(\d+)/);
-            if (!oppMatch) return;
-            const oppWrId = oppMatch[1];
-
-            // 对手汇总行 td[5] 含 moreb{N} id
-            const td5 = $(tr).find('td').eq(5);
-            const morebMatch = (td5.html() || '').match(/id="moreb(\d+)"/);
-            if (!morebMatch) return;
-            const storyId = morebMatch[1];
-
-            const story = $(`#storyb${storyId}`);
-            if (!story.length) return;
-
-            const storyMatches = [];
-            story.find('table tr').each((k, tr2) => {
-                const tds2 = $(tr2).find('td');
-                if (tds2.length < 5) return;
-                const bgStyle2 = ($(tds2[0]).attr('style') || '').toLowerCase();
-                const isWin2 = bgStyle2.includes('#0cf');
-                const isLoss2 = bgStyle2.includes('#434348');
-                if (!isWin2 && !isLoss2) return;
-
-                const dateText2 = $(tds2[0]).text().trim();
-                const dateMatch2 = dateText2.match(/\d{4}-\d{2}-\d{2}/);
-                const mapName2 = $(tds2[1]).text().trim();
-                const eloText2 = $(tds2[2]).text().trim();
-                const format2 = $(tds2[3]).text().trim();
-                const memo2 = $(tds2[4]).text().trim();
-
-                storyMatches.push({
-                    date: dateMatch2 ? dateMatch2[0] : '',
-                    mapName: mapName2,
-                    viewerWon: isWin2,
-                    eloChange: eloText2,
-                    format: format2,
-                    memo: memo2,
-                });
-            });
-            if (storyMatches.length > 0) storyByOpp[oppWrId] = storyMatches;
-        });
-    });
-
-    // ---- 解析 맵별통계 표 (eloboard 공식 집계 맵별 대종족 전적) ----
-    // 개인 홈페이지의 여러 .list-board 중 "저그전"+"총전적" 포함 것이 맵별통계 표
-    // 열 순서: 맵 | 저그전(Z) | 프로토스전(P) | 테란전(T) | 총전적 | 승률
-    const mapStats = {};
-    // 이 표는 .list-board 내에 없고, td[width="25%"] + td[width="15%"]*5 구조를 가짌
-    // 열 순서: 맵 | 저그전(Z) | 프로토스전(P) | 테란전(T) | 총전적 | 승률
-    $('tr').each((i, el) => {
-        const tds = $(el).find('td');
-        if (tds.length < 6) return;
-        const firstTd = $(tds[0]);
-        if (firstTd.attr('width') !== '25%') return;
-        const mapName = firstTd.text().trim();
-        if (!mapName || mapName === '맵') return;
-        const parseWL = (text) => {
-            const m = text.match(/(\d+)승\s*(\d+)패/);
-            return m ? { wins: parseInt(m[1]), losses: parseInt(m[2]) } : { wins: 0, losses: 0 };
-        };
-        const vsZ = parseWL($(tds[1]).text().trim());
-        const vsP = parseWL($(tds[2]).text().trim());
-        const vsT = parseWL($(tds[3]).text().trim());
-        const key = normalize(mapName);
-        if (mapStats[key]) {
-            mapStats[key].vsZ.wins += vsZ.wins; mapStats[key].vsZ.losses += vsZ.losses;
-            mapStats[key].vsP.wins += vsP.wins; mapStats[key].vsP.losses += vsP.losses;
-            mapStats[key].vsT.wins += vsT.wins; mapStats[key].vsT.losses += vsT.losses;
-        } else {
-            mapStats[key] = { mapKr: mapName, vsZ, vsP, vsT };
-        }
-    });
-
-
-    return { wrId, race, elo, avatar, matchCount: matches.length, matches, storyByOpp, mapStats, fetchedAt: new Date().toISOString() };
+    return {
+        wrId,
+        newId,
+        race: info.main_race || '',
+        elo: fmtElo(info.elo_raw),
+        avatar: info.thumb_url ? AVATAR_BASE + info.thumb_url : '',
+        matchCount: matches.length,
+        matches,
+        storyByOpp: {},  // 生涯对战数据仅旧站 HTML 提供，由 merge 的防回退逻辑保留本地既有值
+        mapStats: {},    // 生涯地图统计表同上；新比赛在 syncPlayer 内增量累加
+        fetchedAt: new Date().toISOString(),
+        source: 'api',
+    };
 }
 
 // ---- Save player data to local file ----
@@ -288,26 +209,38 @@ function savePlayerData(wrId, data) {
     fs.writeFileSync(file, JSON.stringify(data));
 }
 
-// ---- 增量合并：页面解析结果 与 本地既有数据 合并 ----
+// ---- 增量合并：API 抓取结果 与 本地既有数据 合并 ----
 // 语义：本地库只增不减 —
-//   1. 页面上出现的比赛（当前 3 个月窗口）取页面最新值
-//   2. 本地有而页面上没有的（已滚出网页窗口的历史）继续保留
-//   3. 新比赛（页面上有、本地没有的）追加
+//   1. API 窗口内出现的比赛（当前 120 天）取 API 最新值
+//   2. 本地有而 API 窗口外的（更早的历史）继续保留
+//   3. 新比赛（API 有、本地没有的）追加
 // 去重键：日期+对手+地图+赛制+胜负；同键多条按数量对账（同日同对手同图多场不误删）
+// 迁移（旧 HTML 数据 → API 数据）：对手 ID 体系不同（旧 wrId vs 新 player_id），
+//   无法逐条对账；API 窗口内的本地旧记录整体替换（API 覆盖更深，是超集），
+//   早于 API 窗口的本地历史保留。合并结果标记 source='api'，后续走常规键对账。
 function mergePlayerData(existing, fresh) {
-    if (!existing || !Array.isArray(existing.matches) || existing.matches.length === 0) {
-        return { data: fresh, newCount: fresh.matches.length }; // 首次抓取：整页入库
-    }
     const keyOf = (m) => `${m.date}|${m.oppWrId || ''}|${m.mapKr || m.mapName}|${m.format}|${m.isWin ? 'W' : 'L'}`;
 
-    // 页面比赛的键计数
+    if (!existing || !Array.isArray(existing.matches) || existing.matches.length === 0) {
+        return { data: fresh, newCount: fresh.matches.length, newRecords: fresh.matches.slice(), isMigration: false }; // 首次抓取：整批入库
+    }
+    const isMigration = existing.source !== 'api' && fresh.source === 'api' && fresh.matches.length > 0;
+
+    let existingMatches = existing.matches;
+    if (isMigration) {
+        // 迁移清洗：丢弃 API 覆盖范围内的本地旧记录（fresh 最老日期之前全保留）
+        const freshOldest = fresh.matches.reduce((min, m) => (m.date && m.date < min ? m.date : min), '9999-12-31');
+        existingMatches = existingMatches.filter(m => !m.date || m.date < freshOldest);
+    }
+
+    // API 比赛的键计数
     const freshCount = {};
     fresh.matches.forEach(m => { const k = keyOf(m); freshCount[k] = (freshCount[k] || 0) + 1; });
 
-    // 本地比赛逐条对账：页面上还有的 → 由页面版本替代；页面上没有的 → 保留为历史
+    // 本地比赛逐条对账：API 上还有的 → 由 API 版本替代；API 上没有的 → 保留为历史
     const consumed = {};
     const history = [];
-    existing.matches.forEach(m => {
+    existingMatches.forEach(m => {
         const k = keyOf(m);
         const used = consumed[k] || 0;
         if (used < (freshCount[k] || 0)) {
@@ -317,17 +250,22 @@ function mergePlayerData(existing, fresh) {
         }
     });
 
-    // 新增数 = 页面总数 − 本地被对账匹配到的数量
-    const matched = existing.matches.length - history.length;
-    const newCount = Math.max(0, fresh.matches.length - matched);
+    // 本次真正新增的 fresh 记录：每键前 consumed[k] 条与本地重复，其余为新增
+    const seenFresh = {};
+    const newRecords = fresh.matches.filter(m => {
+        const k = keyOf(m);
+        seenFresh[k] = (seenFresh[k] || 0) + 1;
+        return seenFresh[k] > (consumed[k] || 0);
+    });
+    const newCount = newRecords.length;
 
     const merged = fresh.matches.concat(history);
     merged.sort((a, b) => (a.date < b.date ? 1 : (a.date > b.date ? -1 : 0)));
 
-    // 元数据（race/elo/avatar/storyByOpp/mapStats）取页面最新值，比赛记录为合并结果
+    // 元数据（race/elo/avatar/storyByOpp/mapStats）取 API 最新值，比赛记录为合并结果
     const data = Object.assign({}, fresh, { matches: merged, matchCount: merged.length });
 
-    // 防回退：页面截断/异常解析导致字段为空时，保留本地已有值（下次好抓取自动覆盖）
+    // 防回退：API 截断/异常解析导致字段为空时，保留本地已有值（下次抓取自动覆盖）
     ['race', 'elo', 'avatar', 'storyByOpp', 'mapStats'].forEach((k) => {
         const v = data[k];
         const isEmpty = v == null || v === '' ||
@@ -335,7 +273,35 @@ function mergePlayerData(existing, fresh) {
         if (isEmpty && existing[k]) data[k] = existing[k];
     });
 
-    return { data, newCount };
+    return { data, newCount, newRecords, isMigration };
+}
+
+// ---- 生涯地图统计增量累计 ----
+// 旧站 HTML 的 맵별통계 表是生涯全量统计（迁移时经防回退保留为基线）；
+// API 每场比赛带对手种族，把「基线之后新入库」的比赛累加进去，保持生涯口径持续更新。
+// mapStatsCutoff = 已累计到的最新比赛日期。
+function tallyMapStats(data, tallyRecords, existing) {
+    const mapStats = data.mapStats && Object.keys(data.mapStats).length > 0
+        ? JSON.parse(JSON.stringify(data.mapStats))
+        : {};
+    let cutoff = (existing && existing.mapStatsCutoff) || '';
+    let added = 0;
+    for (const r of tallyRecords) {
+        if (!r.isSeasonMap || !r.mapKr || !r.oppRace) continue;
+        if (r.date && r.date <= cutoff) continue; // 基线已含（防重复累计）
+        const key = normalize(r.mapKr);
+        if (!mapStats[key]) mapStats[key] = { mapKr: r.mapKr, vsZ: { wins: 0, losses: 0 }, vsP: { wins: 0, losses: 0 }, vsT: { wins: 0, losses: 0 } };
+        const col = { Z: 'vsZ', P: 'vsP', T: 'vsT' }[r.oppRace];
+        if (!col) continue;
+        if (r.isWin) mapStats[key][col].wins++; else mapStats[key][col].losses++;
+        if (r.date && r.date > cutoff) cutoff = r.date;
+        added++;
+    }
+    if (added > 0 || Object.keys(mapStats).length > 0) {
+        data.mapStats = mapStats;
+        data.mapStatsCutoff = cutoff;
+    }
+    return added;
 }
 
 // ---- Sync one player (fetch + incremental merge, with retry) ----
@@ -344,8 +310,20 @@ async function syncPlayer(wrId, opts = {}) {
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
+            const existing = readPlayerData(wrId);
             const fresh = await fetchAndParsePlayer(wrId, opts);
-            const { data, newCount } = mergePlayerData(readPlayerData(wrId), fresh);
+            const { data, newCount, newRecords, isMigration } = mergePlayerData(existing, fresh);
+
+            // 地图统计增量累计：
+            //   常规同步 → 本次新入库的比赛（API 源记录，带对手种族）
+            //   迁移同步 → 基线（旧数据最新一场）之后的新比赛（基线表已含更早的所有场次）
+            let tallyRecords = newRecords;
+            if (isMigration) {
+                const preNewest = existing.matches.reduce((max, m) => (m.date && m.date > max ? m.date : max), '');
+                tallyRecords = fresh.matches.filter(m => m.date && m.date > preNewest);
+            }
+            tallyMapStats(data, tallyRecords, existing);
+
             savePlayerData(wrId, data);
 
             const meta = readMeta();
@@ -757,135 +735,6 @@ function computeH2H(wrId1, wrId2) {
     };
 }
 
-// ---- 从 eloboard 网页实时抓取双人全量对战（storyb 详情）----
-// board 1 的对手汇总行 td[5] 有 moreb{N}，对应 storyb{N} TR 元素
-// storyb{N} 内嵌套 table，每行是一场单场比赛（5 列：日期/地图/胜负elo/方式/备注）
-// 双方主页互补：同一场在 wrId1 主页是「승(+16.8)」，在 wrId2 主页是「패(-16.8)」
-const H2H_CACHE_TTL = 24 * 60 * 60 * 1000; // 1 天
-
-function h2hCacheFile(wrId1, wrId2) {
-    if (!fs.existsSync(H2H_DIR)) fs.mkdirSync(H2H_DIR, { recursive: true });
-    // 文件名按 wrId 升序，确保 A_B 和 B_A 是同一文件
-    const [a, b] = [wrId1, wrId2].sort();
-    return path.join(H2H_DIR, `${a}_${b}.json`);
-}
-
-// 抓取某选手主页 board 1 里 vs oppWrId 的 storyb 详情
-// 返回数组：[{date, mapName, viewerWon, eloChange, format, memo}]
-async function fetchStoryMatches(viewerWrId, oppWrId) {
-    const html = await fetchHtml(PLAYER_PAGE_URL(viewerWrId));
-    const $ = cheerio.load(html);
-    const boards = $('.list-board');
-    if (boards.length < 2) return [];
-    const b1 = $(boards[1]);
-
-    // 在 board 1 中找含 oppWrId 链接的对手汇总行
-    let storyId = null;
-    b1.find('table tbody tr').each((j, tr) => {
-        if (storyId) return;
-        if ($(tr).find(`a[href*="wr_id=${oppWrId}"]`).length > 0) {
-            const td5 = $(tr).find('td').eq(5);
-            const m = (td5.html() || '').match(/id="moreb(\d+)"/);
-            if (m) storyId = m[1];
-        }
-    });
-    if (!storyId) return [];
-
-    const story = $(`#storyb${storyId}`);
-    if (!story.length) return [];
-
-    const matches = [];
-    story.find('table tr').each((j, tr) => {
-        const tds = $(tr).find('td');
-        if (tds.length < 5) return;
-        const bgStyle = ($(tds[0]).attr('style') || '').toLowerCase();
-        const isWin = bgStyle.includes('#0cf');
-        const isLoss = bgStyle.includes('#434348');
-        if (!isWin && !isLoss) return;
-
-        const dateText = $(tds[0]).text().trim();
-        const dateMatch = dateText.match(/\d{4}-\d{2}-\d{2}/);
-        const date = dateMatch ? dateMatch[0] : '';
-
-        const mapName = $(tds[1]).text().trim();
-        const eloText = $(tds[2]).text().trim();
-        const format = $(tds[3]).text().trim();
-        const memo = $(tds[4]).text().trim();
-
-        matches.push({
-            date,
-            mapName,
-            viewerWon: isWin,
-            eloChange: eloText,
-            format,
-            memo,
-        });
-    });
-    return matches;
-}
-
-// 异步抓取：从双方主页 storyb 合并全量对战，缓存 1 天
-// 返回 { matches: [...], fetchedAt }
-async function fetchH2HFromStory(wrId1, wrId2) {
-    const cacheFile = h2hCacheFile(wrId1, wrId2);
-
-    // 1. 先读缓存
-    if (fs.existsSync(cacheFile)) {
-        try {
-            const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
-            if (cached && cached.fetchedAt && (Date.now() - new Date(cached.fetchedAt).getTime() < H2H_CACHE_TTL)) {
-                return cached;
-            }
-        } catch {}
-    }
-
-    // 2. 并发抓取双方主页
-    const [m1, m2] = await Promise.all([
-        fetchStoryMatches(wrId1, wrId2),
-        fetchStoryMatches(wrId2, wrId1),
-    ]);
-
-    // 3. 合并去重：同一场在两边互为镜像，elo 数值相同符号相反
-    // 去重 key 包含 format（如 "끝장전(1)" vs "끝장전(6)"），避免同日同图同胜者
-    // 的多场比赛（如 SET 1 和 SET 6）被误判为重复
-    const seen = new Map();
-    m1.forEach(r => {
-        const matched = matchSeasonMap(r.mapName);
-        const key = `${r.date}|${r.mapName}|${r.viewerWon ? 'p1' : 'p2'}|${r.format}`;
-        if (!seen.has(key)) {
-            seen.set(key, {
-                date: r.date, mapName: r.mapName,
-                mapKr: matched ? matched.kr : '',
-                mapCn: matched ? matched.cn : '',
-                isSeasonMap: !!matched,
-                viewer1Won: r.viewerWon,
-                eloChange: winnerGain(r.eloChange), format: r.format, memo: r.memo,
-            });
-        }
-    });
-    m2.forEach(r => {
-        const matched = matchSeasonMap(r.mapName);
-        const viewer1Won = !r.viewerWon; // 镜像：viewer2 胜 = viewer1 负
-        const key = `${r.date}|${r.mapName}|${viewer1Won ? 'p1' : 'p2'}|${r.format}`;
-        if (!seen.has(key)) {
-            seen.set(key, {
-                date: r.date, mapName: r.mapName,
-                mapKr: matched ? matched.kr : '',
-                mapCn: matched ? matched.cn : '',
-                isSeasonMap: !!matched,
-                viewer1Won,
-                // winnerGain 取绝对值，胜者加分恒为正，无需区分视角反转
-                eloChange: winnerGain(r.eloChange),
-                format: r.format, memo: r.memo,
-            });
-        }
-    });
-
-    const result = { matches: [...seen.values()], fetchedAt: new Date().toISOString() };
-    try { fs.writeFileSync(cacheFile, JSON.stringify(result)); } catch {}
-    return result;
-}
-
 // ---- Stats summary (for status display) ----
 function getStats() {
     const meta = readMeta();
@@ -921,6 +770,7 @@ module.exports = {
     syncPlayer,
     syncAll,
     setFetcher,
+    clearIdMapCache,
     computeMapStats,
     computeRecentMatches,
     computeH2H,
