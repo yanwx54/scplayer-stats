@@ -352,45 +352,85 @@ function findAvatarLocal(wrId) {
 
 // ---- 打包本地数据并上传 ----
 // wrIds 为 null 时上传全部本地选手；否则只上传指定选手（增量模式减小传输量）
+// 服务器 /api/upload-data 单请求限制 30MB（UTF-8 字节）；数据含大量韩文（1字符=3字节），
+// 全量打包实际字节数超字符数约 20%，2026-09-09 全量 30.15MB 触发 413。
+// 修复：按字节预算分片上传，每片独立调用接口写入，服务器代码无需改动。
+const UPLOAD_CHUNK_BYTES = 20 * 1024 * 1024; // 每分片字节预算（20MB，留 10MB 余量）
+
 async function uploadToServer(server, token, wrIds = null) {
-    const payload = { players: {} };
     const wanted = wrIds ? new Set(wrIds.map(String)) : null;
+
+    // 逐选手序列化（便于按字节分片，勿用字符串 length 计量——那是字符数不是字节数）
+    const playerItems = [];
     fs.readdirSync(PLAYERS_DIR).forEach(f => {
         const m = f.match(/^(\d+)\.json$/);
         if (m && (!wanted || wanted.has(m[1]))) {
-            try { payload.players[m[1]] = JSON.parse(fs.readFileSync(path.join(PLAYERS_DIR, f), 'utf8')); }
-            catch (e) { console.warn(`跳过损坏文件 ${f}: ${e.message}`); }
+            try {
+                const json = fs.readFileSync(path.join(PLAYERS_DIR, f), 'utf8');
+                playerItems.push({ wrId: m[1], json, bytes: Buffer.byteLength(json, 'utf8') });
+            } catch (e) { console.warn(`跳过损坏文件 ${f}: ${e.message}`); }
         }
     });
-    const metaFile = path.join(DATA_DIR, 'meta.json');
-    if (fs.existsSync(metaFile)) payload.meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
 
     // 头像打包（base64；服务器写入 data/avatars/ 并经 /avatars 静态提供）
+    const avatarItems = [];
     const AV_DIR = path.join(DATA_DIR, 'avatars');
-    payload.avatars = {};
     if (fs.existsSync(AV_DIR)) {
         fs.readdirSync(AV_DIR).forEach(f => {
             const m = f.match(/^(\d+)(\.\w+)$/);
             if (m && (!wanted || wanted.has(m[1]))) {
-                try { payload.avatars[m[1] + m[2]] = fs.readFileSync(path.join(AV_DIR, f)).toString('base64'); }
-                catch (e) { /* 读取失败跳过 */ }
+                try {
+                    const b64 = fs.readFileSync(path.join(AV_DIR, f)).toString('base64');
+                    avatarItems.push({ name: m[1] + m[2], b64, bytes: Buffer.byteLength(b64, 'utf8') });
+                } catch (e) { /* 读取失败跳过 */ }
             }
         });
     }
 
-    const sizeMB = (JSON.stringify(payload).length / 1024 / 1024).toFixed(2);
-    console.log(`\n=== 上传数据到服务器 ===`);
-    console.log(`打包 ${Object.keys(payload.players).length} 个选手数据（${sizeMB}MB）→ ${server}`);
+    const metaFile = path.join(DATA_DIR, 'meta.json');
+    const metaJson = fs.existsSync(metaFile) ? fs.readFileSync(metaFile, 'utf8') : null;
 
-    const r = await axios.post(`${server.replace(/\/$/, '')}/api/upload-data`, payload, {
-        headers: { Authorization: 'Bearer ' + token },
-        timeout: 180000,
-    });
-    if (r.data && r.data.ok) {
-        console.log(`✓ 上传成功：服务器已写入 ${r.data.playersWritten} 个选手数据`);
-    } else {
-        throw new Error('上传失败: ' + JSON.stringify(r.data));
+    // 贪心分片：players / avatars / meta 混装，每片累计字节 ≤ 预算
+    const ITEM_OVERHEAD = 64; // JSON 键名等结构开销的粗略估算
+    const chunks = [];
+    let cur = { players: [], avatars: [], meta: false }, curBytes = 0;
+    const push = (item) => {
+        if (curBytes + item.bytes + ITEM_OVERHEAD > UPLOAD_CHUNK_BYTES &&
+            (cur.players.length || cur.avatars.length || cur.meta)) {
+            chunks.push(cur);
+            cur = { players: [], avatars: [], meta: false }; curBytes = 0;
+        }
+        if (item.kind === 'player') { cur.players.push(item); curBytes += item.bytes + ITEM_OVERHEAD; }
+        else if (item.kind === 'avatar') { cur.avatars.push(item); curBytes += item.bytes + ITEM_OVERHEAD; }
+        else { cur.meta = true; curBytes += item.bytes + ITEM_OVERHEAD; }
+    };
+    playerItems.forEach(p => push({ kind: 'player', ...p }));
+    avatarItems.forEach(a => push({ kind: 'avatar', ...a }));
+    if (metaJson) push({ kind: 'meta', json: metaJson, bytes: Buffer.byteLength(metaJson, 'utf8') });
+    if (cur.players.length || cur.avatars.length || cur.meta) chunks.push(cur);
+
+    const totalBytes = playerItems.reduce((s, p) => s + p.bytes, 0) +
+        avatarItems.reduce((s, a) => s + a.bytes, 0) + (metaJson ? Buffer.byteLength(metaJson, 'utf8') : 0);
+    console.log(`\n=== 上传数据到服务器 ===`);
+    console.log(`打包 ${playerItems.length} 个选手数据（${(totalBytes / 1048576).toFixed(2)}MB，分 ${chunks.length} 片）→ ${server}`);
+
+    let written = 0;
+    for (let i = 0; i < chunks.length; i++) {
+        const c = chunks[i];
+        const payload = { players: {}, avatars: {} };
+        c.players.forEach(p => payload.players[p.wrId] = JSON.parse(p.json));
+        c.avatars.forEach(a => payload.avatars[a.name] = a.b64);
+        if (c.meta && metaJson) payload.meta = JSON.parse(metaJson);
+
+        const r = await axios.post(`${server.replace(/\/$/, '')}/api/upload-data`, payload, {
+            headers: { Authorization: 'Bearer ' + token },
+            timeout: 180000,
+        });
+        if (!(r.data && r.data.ok)) throw new Error('上传失败: ' + JSON.stringify(r.data));
+        written += r.data.playersWritten || 0;
+        console.log(`  分片 ${i + 1}/${chunks.length} ✓`);
     }
+    console.log(`✓ 上传成功：服务器已写入 ${written} 个选手数据`);
 }
 
 // ---- Main ----
