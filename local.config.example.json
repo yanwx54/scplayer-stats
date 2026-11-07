@@ -1,0 +1,16 @@
+{
+  "server": "http://<服务器IP>:3001",
+  "token": "<与服务器 data/upload-token.txt 一致>",
+  "mail": {
+    "enabled": true,
+    "host": "smtp.163.com",
+    "port": 465,
+    "secure": true,
+    "user": "yanwx54@163.com",
+    "pass": "<163邮箱客户端授权码（在163邮箱设置→POP3/SMTP/IMAP→开启服务后获取，不是登录密码）>",
+    "from": "yanwx54@163.com",
+    "to": "yanwx54@163.com",
+    "allowInvalidCert": true,
+    "failRatioThreshold": 0.2
+  }
+}

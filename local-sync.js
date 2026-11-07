@@ -23,13 +23,16 @@
  * 前置：无需手动操作 — 若 9222 调试端口未开放，脚本自动以独立 profile
  *       （.sync-chrome/）启动专用 Chrome，会话持久化在 profile 中，
  *       同步结束后自动关闭该实例，不影响日常浏览器。
- * 配置：local.config.json  { "server": "http://服务器:3001", "token": "..." }
+ * 配置：local.config.json  { "server": "http://服务器:3001", "token": "...",
+ *                          "mail": { ... }（失败邮件告警，可选，模板见 local.config.example.json） }
  */
+const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const { spawn, execSync } = require('child_process');
 const axios = require('axios');
 const db = require('./db');
+const mailAlert = require('./mail-alert');
 
 const CONFIG_FILE = path.join(__dirname, 'local.config.json');
 const DATA_DIR = path.join(__dirname, 'data');
@@ -67,6 +70,7 @@ function parseArgs() {
         avatarsOnly: args.includes('--avatars-only'), // 只下载头像（不重抓比赛数据）
         rebuildIdMap: args.includes('--rebuild-id-map'), // 重建旧wrId→新playerId映射
         full: args.includes('--full'),              // 强制全量（默认增量：只同步活跃选手）
+        testMail: args.includes('--test-mail'),      // 立即发送一封测试告警邮件，验证凭据
     };
 }
 
@@ -465,6 +469,82 @@ async function uploadToServer(server, token, wrIds = null) {
     console.log(`✓ 上传成功：服务器已写入 ${written} 个选手数据`);
 }
 
+// ---- 失败邮件告警（只告警，不改变同步主流程与退出码）----
+let runAlerted = false;   // 本次运行已发过告警（避免 0 成功后再发“异常退出”重复邮件）
+let uploadDone = false;   // 本次运行是否已成功上传
+
+function formatNow() {
+    return new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+}
+
+function readLogTail(limit = 25) {
+    try {
+        const p = path.join(__dirname, 'sync-local.log');
+        if (!fs.existsSync(p)) return '(无 sync-local.log)';
+        const lines = fs.readFileSync(p, 'utf8').trim().split(/\r?\n/).filter(Boolean);
+        return lines.slice(-limit).join('\n') || '(日志为空)';
+    } catch (e) {
+        return `(读取日志失败：${e.message})`;
+    }
+}
+
+function failureSummaryLines(result) {
+    const lines = [];
+    if (!result) return lines;
+    const ft = result.failTypes || {};
+    lines.push(`结果：成功 ${result.success}/${result.total}，失败 ${result.failed.length}`);
+    lines.push(`失败分类：403拦截=${ft.forbidden || 0}，JSON解析=${ft.json || 0}，响应异常=${ft.contract || 0}，ID映射=${ft.idmap || 0}，网络/其它=${ft.other || 0}`);
+    if (result.emptyWindow) lines.push(`窗口内 0 场：${result.emptyWindow} 人（休眠选手或无新比赛，非错误）`);
+    if (result.failed.length > 0) {
+        lines.push('', '错误行（日志摘录）：');
+        result.failed.slice(0, 10).forEach(f => {
+            lines.push(`✗ ${f.player.cnName}(${f.player.krName}) wrId=${f.player.wrId} ERROR: ${f.error}`);
+        });
+        if (result.failed.length > 10) lines.push(`… 其余 ${result.failed.length - 10} 条已省略`);
+    }
+    return lines;
+}
+
+async function sendFailureAlert(config, { reasonKey, title, mode, result, conclusion, extraLines }) {
+    try {
+        if (runAlerted) {
+            console.log('⚠ 本次运行已发送过失败告警，跳过重复告警');
+            return;
+        }
+        runAlerted = true;
+        const lines = [
+            `时间：${formatNow()}（Asia/Shanghai）`,
+            `主机：${os.hostname()}`,
+            `同步模式：${mode}`,
+            ...failureSummaryLines(result),
+        ];
+        if (extraLines) lines.push('', '异常详情：', String(extraLines));
+        lines.push('', `结论：${conclusion}`, '', '最近同步日志（sync-local.log 末尾 25 行）：', readLogTail(25));
+        await mailAlert.notify(config, { reasonKey, subject: `[SC Stats 同步失败] ${title} · ${formatNow()}`, text: lines.join('\n') });
+    } catch (e) {
+        // 告警本身绝不抛出，避免影响同步结果与退出码
+        console.log(`⚠ 失败告警流程出错（已忽略）：${e.message}`);
+    }
+}
+
+// 上传失败统一入口：先告警再抛错（告警失败也不影响抛错/退出码）
+async function uploadWithAlert(config, wrIds, mode) {
+    try {
+        await uploadToServer(config.server, config.token, wrIds);
+        uploadDone = true;
+    } catch (e) {
+        await sendFailureAlert(config, {
+            reasonKey: 'upload-failed',
+            title: '上传服务器失败',
+            mode,
+            result: null,
+            conclusion: '线上数据未更新（上传失败，服务器仍为上一次成功上传的数据）',
+            extraLines: e.message,
+        });
+        throw e;
+    }
+}
+
 // ---- Main ----
 async function main() {
     const opts = parseArgs();
@@ -479,10 +559,42 @@ async function main() {
 
     db.ensureDirs();
 
+    // --test-mail：立即发一封测试告警邮件（验证 SMTP 凭据，不触发同步）
+    if (opts.testMail) {
+        console.log('=== --test-mail：发送测试告警邮件 ===');
+        const conf = mailAlert.resolveConfig(config);
+        if (!conf.enabled) {
+            console.error(conf.configured
+                ? '✗ 告警已禁用（mail.enabled=false 或 SC_ALERT_ENABLED=0）'
+                : '✗ 未配置 SMTP 凭据：请在 local.config.json 的 mail.user / mail.pass 填入 163 邮箱和客户端授权码（或用 SC_ALERT_SMTP_USER / SC_ALERT_SMTP_PASS 环境变量）');
+            process.exit(2);
+        }
+        try {
+            await mailAlert.send(conf, {
+                subject: `[SC Stats 测试邮件] ${formatNow()}`,
+                text: [
+                    '这是一封同步失败告警的测试邮件。',
+                    '',
+                    `时间：${formatNow()}（Asia/Shanghai）`,
+                    `主机：${os.hostname()}`,
+                    `SMTP：${conf.host}:${conf.port}（secure=${conf.secure}）`,
+                    `收件人：${conf.to}`,
+                    '',
+                    '收到此邮件说明 SMTP 凭据与网络均可用。',
+                ].join('\n'),
+            });
+            console.log(`✓ 测试邮件已发送至 ${conf.to}`);
+            process.exit(0);
+        } catch (e) {
+            console.error(`✗ 测试邮件发送失败：${e.message}`);
+            process.exit(1);
+        }
+    }
+
     // --upload-only：跳过抓取，直接推送本地已有数据（服务器恢复可达后补传用）
     if (opts.uploadOnly) {
         console.log('=== --upload-only：跳过抓取，直接推送本地数据 ===');
-        await uploadToServer(config.server, config.token);
+        await uploadWithAlert(config, undefined, '--upload-only');
         return;
     }
 
@@ -510,7 +622,7 @@ async function main() {
             }
         }
         // 头像上传到服务器（uploadToServer 会连带打包本地选手数据）
-        await uploadToServer(config.server, config.token);
+        await uploadWithAlert(config, undefined, '--avatars-only');
         return;
     }
 
@@ -537,6 +649,9 @@ async function main() {
         console.log(`=== 附着 Chrome 页面内 fetch 同步 ${players.length} 个选手 ===`);
     }
     const uploadWrIds = players.map(p => p.wrId); // 上传只传本次同步过的选手（增量减小传输量）
+    const modeText = isFull
+        ? (autoFull ? '全量（自动触发）' : '全量（--full）')
+        : (opts.wrIds.length > 0 ? `指定选手（${players.length} 人）` : '增量');
 
     const { browser, context, launchedPid } = await attachChrome();
     let syncOk = false;
@@ -574,19 +689,64 @@ async function main() {
     // 0 成功 = 抓取链路整体失效（历史上曾因 403 全失败却继续上传，形成“假成功”）；直接失败退出
     if (result && players.length > 0 && result.success === 0) {
         console.error(`✗ 同步失败：${players.length} 个选手全部失败（0 成功），本次没有产生任何新数据，已跳过上传`);
+        await sendFailureAlert(config, {
+            reasonKey: 'zero-success',
+            title: '0 个选手同步成功',
+            mode: modeText,
+            result,
+            conclusion: '线上数据未更新（本次 0 人成功，已跳过上传；服务器仍为上一次成功同步的数据）',
+        });
         throw new Error('0 个选手同步成功（疑似数据源拦截或接口异常）');
     }
+
+    // 部分失败：失败占比达到阈值（默认 20%，配置 mail.failRatioThreshold）也告警
+    const mailConf = mailAlert.resolveConfig(config);
+    const failRatioLimit = Number.isFinite(mailConf.failRatio) ? mailConf.failRatio : 0.2;
+    const partialFailed = result && result.failed.length > 0 && players.length > 0
+        && (result.failed.length / players.length) >= failRatioLimit;
+
     if (opts.noUpload) {
         console.log('\n--no-upload：跳过上传');
+        if (partialFailed) {
+            await sendFailureAlert(config, {
+                reasonKey: 'partial-failure',
+                title: `部分选手失败（${result.success}/${players.length} 成功）`,
+                mode: modeText,
+                result,
+                conclusion: '本地数据部分更新；本次为 --no-upload，线上数据未更新',
+            });
+        }
         return;
     }
-    await uploadToServer(config.server, config.token, uploadWrIds);
+    await uploadWithAlert(config, uploadWrIds, modeText);
+    if (partialFailed) {
+        await sendFailureAlert(config, {
+            reasonKey: 'partial-failure',
+            title: `部分选手失败（${result.success}/${players.length} 成功）`,
+            mode: modeText,
+            result,
+            conclusion: `线上数据已部分更新：${result.success} 人已上传，失败 ${result.failed.length} 人未更新`,
+        });
+    }
 }
 
 main().then(() => {
     console.log(`\n全部完成 ${new Date().toLocaleString()}`);
     process.exit(0);
-}).catch(e => {
+}).catch(async e => {
     console.error('失败:', e.message);
+    // 异常退出同样告警（0 成功/上传失败已发过告警的不重复发）
+    if (!runAlerted) {
+        let config = null;
+        try { config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (e2) { /* 配置缺失时仍可用环境变量告警 */ }
+        await sendFailureAlert(config, {
+            reasonKey: 'exception',
+            title: '脚本异常退出',
+            mode: '未知（同步未完成）',
+            result: null,
+            conclusion: uploadDone ? '线上数据已更新（异常发生在上传完成之后）' : '线上数据未更新（本次同步未完成）',
+            extraLines: `${e.message}\n${String(e.stack || '').split('\n').slice(0, 4).join('\n')}`,
+        });
+    }
     process.exit(1);
 });

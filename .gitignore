@@ -30,6 +30,7 @@ data/upload-token.txt
 data/avatars/
 data/player-id-map.json
 data/players-backup-*/
+data/mail-alert-state.json
 
 # 诊断产物（迁移调试用，可随时重建/删除）
 diag-*
