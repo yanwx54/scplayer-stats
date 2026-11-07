@@ -1,11 +1,12 @@
 /**
- * local-sync.js — 附着日常 Chrome 过盾 API 同步 + 推送服务器
+ * local-sync.js — 附着 Chrome「页面内 fetch」同步 eloboard API + 推送服务器
  *
- * 背景：eloboard.com 启用 Cloudflare Turnstile 反爬，服务器和自动化浏览器均被拦，
- *       但日常使用的真实 Chrome（真人环境信誉）可自动过盾。
+ * 背景：eloboard.com 有客户端指纹反爬。2026-11 起对 /api/* 收紧：curl / axios /
+ *       Playwright context.request（Node 网络栈）一律 nginx 403，而真实 Chrome 页面内
+ *       fetch 正常 200（与 Cookie 无关）。
  *       2026-08 网站改版：旧 HTML 选手页废弃，改为 JSON API（/api/players、/api/matches）。
- * 方案：附着到专用 Chrome（CDP 9222），在过盾浏览器会话内调用新版 API 抓取
- *       全部选手数据，写入本地 data/ 后推送到服务器。
+ * 方案：附着到专用 Chrome（CDP 9222），在页面上下文用 fetch 抓取新版 API 的选手详情与
+ *       比赛分页，写入本地 data/ 后推送到服务器。
  *
  * 用法：
  *   node local-sync.js               # 增量同步（默认）：只抓近 14 天有比赛的活跃选手，
@@ -20,7 +21,7 @@
  *
  * 依赖：npm i -D patchright（或 playwright）
  * 前置：无需手动操作 — 若 9222 调试端口未开放，脚本自动以独立 profile
- *       （.sync-chrome/）启动专用 Chrome，过盾 cookie 持久化在 profile 中，
+ *       （.sync-chrome/）启动专用 Chrome，会话持久化在 profile 中，
  *       同步结束后自动关闭该实例，不影响日常浏览器。
  * 配置：local.config.json  { "server": "http://服务器:3001", "token": "..." }
  */
@@ -220,46 +221,77 @@ async function attachChrome() {
     return { browser, context, launchedPid };
 }
 
-// ---- 等待页面通过 Cloudflare 盾（无交互 managed challenge 自动过）----
-// 盾页标题各语言版本：Just a moment… / 잠시만… / 请稍候… / Verifying…
-const SHIELD_TITLE_RE = /just a moment|잠시만|请稍候|安全验证|security check|checking your browser|verifying|attention required/i;
+// ---- 页面上下文抓取 ----
+// 2026-11 起 eloboard 对 /api/* 增加客户端指纹拦截：curl / axios / Playwright
+// context.request（Node 网络栈）一律返回 nginx 403，而真实 Chrome 页面内 fetch
+// 正常返回 200（且与 Cookie 无关，空 profile 同样可用）。
+// 因此所有 API 请求都必须在页面上下文执行，不能再走 context.request。
+const API_PROBE_URL = 'https://eloboard.com/api/players?limit=1&offset=0';
 
-async function waitPassShield(page, timeoutMs = 60000) {
-    try {
-        await page.waitForFunction(
-            () => !/just a moment|잠시만|请稍候|安全验证|security check|checking your browser|verifying|attention required/i.test(document.title),
-            { timeout: timeoutMs }
-        );
-        return true;
-    } catch (e) {
-        return false; // 超时仍未通过
-    }
+// 页面内 fetch，返回 { status, text }
+async function pageFetch(page, url) {
+    return page.evaluate(async (u) => {
+        const resp = await fetch(u, { cache: 'no-store' });
+        let text = '';
+        try { text = await resp.text(); } catch (e) { text = ''; }
+        return { status: resp.status, text };
+    }, url);
 }
 
-// ---- 用浏览器会话构造 JSON API 抓取器（注入 db，替代 axios 直连）----
-// context.request 自带过盾 cookie（cf_clearance），API 请求无需打开页面
-function makeApiFetcher(context) {
-    return async (url) => {
-        const r = await context.request.get(url, { timeout: 30000 });
-        if (!r.ok()) throw new Error(`HTTP ${r.status()}: ${url}`);
-        const text = await r.text();
-        try { return JSON.parse(text); }
-        catch (e) { throw new Error(`非 JSON 响应(${String(text).slice(0, 80)}): ${url}`); }
-    };
+// 页面内取 JSON；错误信息带分类前缀（403 拦截 / HTTP 状态 / JSON 解析），便于统计
+async function pageGetJson(page, url) {
+    const r = await pageFetch(page, url);
+    if (r.status === 403) throw new Error(`HTTP 403（被反爬拦截）: ${url}`);
+    if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status}: ${url}`);
+    try { return JSON.parse(r.text); }
+    catch (e) { throw new Error(`JSON 解析失败(${String(r.text).slice(0, 80)}): ${url}`); }
+}
+
+// 打开 eloboard 页面（供页面内 fetch），并做一次 API 可用性探测：
+// 403 → 明确报错（拦截策略再次升级）；非 200 → 明确报错。不再输出“过盾就绪”式误报。
+async function openApiPage(context) {
+    const page = await context.newPage();
+    let loaded = false;
+    for (let i = 0; i < 3 && !loaded; i++) {
+        try {
+            console.log(`打开 eloboard.com 页面（页面内 fetch 抓取）${i > 0 ? `（第 ${i + 1} 次尝试）` : ''}…`);
+            await page.goto(ENTRY_URL, { waitUntil: 'domcontentloaded', timeout: 90000 });
+            console.log(`  页面已加载：${await page.title()}`);
+            loaded = true;
+        } catch (e) {
+            if (i === 2) throw e;
+            console.log(`  ⚠ 入口页失败(${e.message.split('\n')[0]})，30s 后重试`);
+            await sleep(30000);
+        }
+    }
+    const probe = await pageFetch(page, API_PROBE_URL);
+    if (probe.status === 403) {
+        await page.close().catch(() => {});
+        throw new Error('eloboard /api 返回 403（页面内 fetch 也被拦，站点拦截策略可能再次升级）');
+    }
+    if (probe.status !== 200) {
+        await page.close().catch(() => {});
+        throw new Error(`eloboard /api 探测失败：HTTP ${probe.status}`);
+    }
+    console.log('✓ 页面内 fetch 可用（/api/players 返回 200）');
+    return page;
+}
+
+// ---- 用页面会话构造 JSON API 抓取器（注入 db，替代 axios/context.request 直连）----
+function makeApiFetcher(page) {
+    return (url) => pageGetJson(page, url);
 }
 
 // ---- 重建 旧wrId → 新playerId 映射（全量枚举新站选手，按韩文名匹配 MD 列表）----
 // 输出 data/player-id-map.json；同名选手取 games 最多者
-async function rebuildIdMap(context, players) {
+async function rebuildIdMap(page, players) {
     console.log('=== 重建 ID 映射（全量枚举新站选手）===');
     const all = [];
     let offset = 0;
     const LIMIT = 200;
     while (true) {
-        const r = await context.request.get(`https://eloboard.com/api/players?limit=${LIMIT}&offset=${offset}`, { timeout: 30000 });
-        if (!r.ok()) throw new Error(`HTTP ${r.status()}`);
-        let arr;
-        try { arr = JSON.parse(await r.text()); } catch (e) { throw new Error('选手列表非 JSON 响应'); }
+        // 与选手/比赛抓取同路径：页面上下文 fetch（Node 网络栈会被 nginx 403）
+        const arr = await pageGetJson(page, `https://eloboard.com/api/players?limit=${LIMIT}&offset=${offset}`);
         if (!Array.isArray(arr) || arr.length === 0) break;
         all.push(...arr);
         process.stdout.write(`\r已拉取 ${all.length}`);
@@ -464,16 +496,12 @@ async function main() {
     if (opts.avatarsOnly) {
         console.log(`=== --avatars-only：下载 ${players.length} 个选手头像 ===`);
         const { browser, context, launchedPid } = await attachChrome();
+        let apiPage = null;
         try {
-            const entry = await context.newPage();
-            try {
-                console.log('访问 eloboard.com 激活过盾状态…');
-                await entry.goto(ENTRY_URL, { waitUntil: 'domcontentloaded', timeout: 90000 });
-                await waitPassShield(entry, 90000);
-                console.log('✓ 过盾状态就绪');
-            } finally { await entry.close(); }
+            apiPage = await openApiPage(context);
             await downloadAvatars(context, players);
         } finally {
+            if (apiPage) await apiPage.close().catch(() => {});
             await browser.close();
             if (launchedPid) {
                 await sleep(1500);
@@ -506,36 +534,19 @@ async function main() {
     } else if (isFull) {
         console.log(`=== 全量同步 ${players.length} 个选手${autoFull ? `（距上次全量 ${daysSinceFull.toFixed(1)} 天，自动转全量）` : '（--full）'} ===`);
     } else {
-        console.log(`=== 附着 Chrome 过盾同步 ${players.length} 个选手 ===`);
+        console.log(`=== 附着 Chrome 页面内 fetch 同步 ${players.length} 个选手 ===`);
     }
     const uploadWrIds = players.map(p => p.wrId); // 上传只传本次同步过的选手（增量减小传输量）
 
     const { browser, context, launchedPid } = await attachChrome();
     let syncOk = false;
+    let apiPage = null;
+    let result = null;
     try {
-        // 先访问主页过一次盾，激活会话信誉（同 tab 内导航共享过盾状态）
-        // 入口页偶发超时/限流，重试 3 次（间隔递增）
-        const entry = await context.newPage();
-        try {
-            let entryOk = false;
-            for (let i = 0; i < 3 && !entryOk; i++) {
-                try {
-                    console.log(`访问 eloboard.com 激活过盾状态${i > 0 ? `（第 ${i + 1} 次尝试）` : ''}…`);
-                    await entry.goto(ENTRY_URL, { waitUntil: 'domcontentloaded', timeout: 90000 });
-                    await waitPassShield(entry, 90000);
-                    entryOk = true;
-                } catch (e) {
-                    if (i === 2) throw e;
-                    console.log(`  ⚛ 入口页失败(${e.message.split('\n')[0]})，30s 后重试`);
-                    await sleep(30000);
-                }
-            }
-            console.log('✓ 过盾状态就绪');
-        } finally {
-            await entry.close();
-        }
+        // 打开 eloboard 页面：既是抓取载体（页面内 fetch），也做一次 API 可用性探测
+        apiPage = await openApiPage(context);
 
-        db.setFetcher(makeApiFetcher(context));
+        db.setFetcher(makeApiFetcher(apiPage));
 
         // ID 映射缺失或 --rebuild-id-map 时，同步前先重建映射
         const idMapFile = path.join(__dirname, 'data', 'player-id-map.json');
@@ -543,12 +554,13 @@ async function main() {
         try { hasIdMap = !!JSON.parse(fs.readFileSync(idMapFile, 'utf8')).oldToNew; } catch (e) {}
         if (!hasIdMap || opts.rebuildIdMap) {
             if (!opts.rebuildIdMap) console.log('⚠ 缺少 ID 映射文件，自动重建…');
-            await rebuildIdMap(context, players);
+            await rebuildIdMap(apiPage, players);
         }
-        await db.syncAll(players, { concurrency: 1, delay: 800, silent: false, full: isFull });
+        result = await db.syncAll(players, { concurrency: 1, delay: 800, silent: false, full: isFull });
         await downloadAvatars(context, players); // 同步完趁浏览器会话还在，下载头像
         syncOk = true;
     } finally {
+        if (apiPage) await apiPage.close().catch(() => {});
         await browser.close(); // 只断开 CDP 连接
         // 若 Chrome 由本脚本启动，同步结束后关闭（过盾 cookie 已持久化在 profile）
         if (launchedPid) {
@@ -559,6 +571,11 @@ async function main() {
     }
 
     if (!syncOk) throw new Error('同步过程出错');
+    // 0 成功 = 抓取链路整体失效（历史上曾因 403 全失败却继续上传，形成“假成功”）；直接失败退出
+    if (result && players.length > 0 && result.success === 0) {
+        console.error(`✗ 同步失败：${players.length} 个选手全部失败（0 成功），本次没有产生任何新数据，已跳过上传`);
+        throw new Error('0 个选手同步成功（疑似数据源拦截或接口异常）');
+    }
     if (opts.noUpload) {
         console.log('\n--no-upload：跳过上传');
         return;

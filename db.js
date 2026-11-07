@@ -98,7 +98,7 @@ let apiGet = async (url) => {
     const response = await axios.get(url, { timeout: 45000 });
     return response.data;
 };
-// 注入自定义抓取器：fn(url) => 解析后的 JSON（local-sync 注入 Playwright context.request）
+// 注入自定义抓取器：fn(url) => 解析后的 JSON（local-sync 注入「页面内 fetch」抓取器）
 function setFetcher(fn) { apiGet = fn; }
 
 // ---- ID 映射（旧 wrId ↔ 新 player_id，由 local-sync --rebuild-id-map 生成）----
@@ -333,6 +333,7 @@ async function syncPlayer(wrId, opts = {}) {
 
             if (!opts.silent) console.log(`  ✓ wrId=${wrId} race=${data.race} matches=${data.matchCount}${newCount > 0 ? ` (+${newCount}新)` : ''}`);
             data._newCount = newCount; // 仅供调用方日志用，不入库
+            data._emptyWindow = fresh.matches.length === 0; // API 窗口内 0 场（休眠/无新比赛，非错误）
             return data;
         } catch (e) {
             lastErr = e;
@@ -347,12 +348,23 @@ async function syncPlayer(wrId, opts = {}) {
 }
 
 // ---- Sync all players ----
+// 失败原因分类：403 拦截 / JSON 解析 / 响应结构异常 / ID 映射缺失 / 网络或其它
+function classifySyncError(msg) {
+    const m = String(msg || '');
+    if (/403/.test(m)) return 'forbidden';
+    if (/JSON 解析失败|非 JSON/.test(m)) return 'json';
+    if (/响应异常/.test(m)) return 'contract';
+    if (/ID 映射/.test(m)) return 'idmap';
+    return 'other';
+}
+
 async function syncAll(players, opts = {}) {
     ensureDirs();
     const concurrency = opts.concurrency || 3;
     const delay = opts.delay || 1500; // ms between batches, be polite to server
     let done = 0;
     const failed = [];
+    let emptyWindow = 0;
 
     for (let i = 0; i < players.length; i += concurrency) {
         const batch = players.slice(i, i + concurrency);
@@ -365,10 +377,11 @@ async function syncAll(players, opts = {}) {
             done++;
             if (r.status === 'fulfilled') {
                 const nc = r.value._newCount || 0;
-                console.log(`  [${done}/${players.length}] ✓ ${p.cnName}(${p.krName}) wrId=${p.wrId} race=${r.value.race} matches=${r.value.matchCount}${nc > 0 ? ` (+${nc}新)` : ''}`);
+                if (r.value._emptyWindow) emptyWindow++;
+                console.log(`  [${done}/${players.length}] ✓ ${p.cnName}(${p.krName}) wrId=${p.wrId} race=${r.value.race} matches=${r.value.matchCount}${nc > 0 ? ` (+${nc}新)` : ''}${r.value._emptyWindow ? '（窗口内 0 场）' : ''}`);
             } else {
                 console.log(`  [${done}/${players.length}] ✗ ${p.cnName}(${p.krName}) wrId=${p.wrId} ERROR: ${r.reason.message}`);
-                failed.push({ player: p, error: r.reason.message });
+                failed.push({ player: p, error: r.reason.message, type: classifySyncError(r.reason.message) });
             }
         });
         if (i + concurrency < players.length && delay > 0) {
@@ -377,14 +390,23 @@ async function syncAll(players, opts = {}) {
     }
 
     const meta = readMeta();
-    if (opts.full !== false) meta.lastFullSync = new Date().toISOString(); // 增量模式不覆盖全量时间
+    // 只有真正成功过才更新全量时间，避免“全失败却把全量计时器推进 7 天”
+    if (opts.full !== false && players.length - failed.length > 0) meta.lastFullSync = new Date().toISOString();
     writeMeta(meta);
 
-    console.log(`\n同步完成: ${players.length - failed.length}/${players.length} 成功, ${failed.length} 失败`);
+    const failTypes = { forbidden: 0, json: 0, contract: 0, idmap: 0, other: 0 };
+    failed.forEach(f => { failTypes[f.type] = (failTypes[f.type] || 0) + 1; });
+    const success = players.length - failed.length;
+
+    console.log(`\n同步完成: ${success}/${players.length} 成功, ${failed.length} 失败`);
     if (failed.length > 0) {
-        console.log('失败列表:', failed.map(f => `${f.player.cnName}(wrId=${f.player.wrId})`).join(', '));
+        console.log(`  失败分类: 403拦截=${failTypes.forbidden}, JSON解析=${failTypes.json}, 响应异常=${failTypes.contract}, ID映射=${failTypes.idmap}, 网络/其它=${failTypes.other}`);
+        console.log('  失败列表:', failed.map(f => `${f.player.cnName}(wrId=${f.player.wrId})`).join(', '));
     }
-    return { total: players.length, success: players.length - failed.length, failed };
+    if (emptyWindow > 0) {
+        console.log(`  窗口内 0 场比赛: ${emptyWindow} 人（可能为休眠选手或无新比赛，非错误）`);
+    }
+    return { total: players.length, success, failed, failTypes, emptyWindow };
 }
 
 // ---- Compute map stats by matchup from local data ----
