@@ -20,6 +20,7 @@ const ID_MAP_FILE = path.join(DATA_DIR, 'player-id-map.json'); // 旧wrId ↔ �
 const MATCH_WINDOW_DAYS = 120;  // 每次同步拉取的比赛深度（UI 需要 90 天，留余量）
 const PAGE_LIMIT = 200;         // /api/matches 单页上限
 const MAX_PAGES = 30;           // 单选手分页安全上限（30×200=6000 场，远超 120 天量）
+const STALE_LAG_DAYS = 1;       // 接口自报最新比赛 vs 实际抓到的最大日期，落后超过此天数即判"数据过期"
 
 // ---- Season maps (shared with server) ----
 const MAPS_JSON = path.join(__dirname, 'public', 'maps.json');
@@ -169,7 +170,11 @@ async function fetchAndParsePlayer(wrId, opts = {}) {
     const newId = map.oldToNew[wrId];
 
     // 选手详情：种族 / 当前 ELO / 头像
-    const info = await apiGet(`${API_BASE}/players/${newId}`);
+    // 2026-11 起 eloboard 的 /api/* 会被中间层缓存：同一 URL 反复请求可能一直拿到
+    // 数天前的旧快照（本地同步全部“成功”却永远抓不到新比赛）。每次抓取带 _t 时间戳，
+    // 让缓存键必然变化，绕开任何 HTTP/CDN/代理缓存。
+    const cacheBust = Date.now();
+    const info = await apiGet(`${API_BASE}/players/${newId}?_t=${cacheBust}`);
     if (!info || !info.id) throw new Error(`选手详情响应异常（wrId=${wrId}, newId=${newId}）`);
 
     // 比赛列表：分页拉取，直到越过窗口或翻完
@@ -177,7 +182,7 @@ async function fetchAndParsePlayer(wrId, opts = {}) {
     const matches = [];
     for (let page = 0; page < MAX_PAGES; page++) {
         const offset = page * PAGE_LIMIT;
-        const arr = await apiGet(`${API_BASE}/matches?player_id=${newId}&limit=${PAGE_LIMIT}&offset=${offset}`);
+        const arr = await apiGet(`${API_BASE}/matches?player_id=${newId}&limit=${PAGE_LIMIT}&offset=${offset}&_t=${cacheBust}`);
         if (!Array.isArray(arr)) throw new Error(`比赛列表响应异常（wrId=${wrId}, offset=${offset}）`);
         for (const m of arr) {
             if (m.played_on && m.played_on < cutoff) continue; // 窗口外（页内跨界部分）
@@ -186,6 +191,21 @@ async function fetchAndParsePlayer(wrId, opts = {}) {
         if (arr.length < PAGE_LIMIT) break;       // 翻完
         if (arr[arr.length - 1].played_on < cutoff) break; // 最老一条已越界
         await new Promise(r => setTimeout(r, 200)); // 分页间礼貌间隔
+    }
+
+    // ---- 新鲜度校验（防"假成功"）----
+    // 中间层缓存/降级时会返回 200 + 数天前的旧快照：同步"成功"了却永远抓不到新比赛。
+    // 用接口自报的 last_played_on 与本次实际抓到的最大比赛日期对账，落后即判失败（触发重试/告警）。
+    const apiLastPlayed = String(info.last_played_on || '').slice(0, 10);
+    const newestFetched = matches.reduce((max, m) => (m.date && m.date > max ? m.date : max), '');
+    if (apiLastPlayed && apiLastPlayed >= cutoff) {
+        const lagDays = newestFetched
+            ? Math.round((Date.parse(apiLastPlayed) - Date.parse(newestFetched)) / 86400000)
+            : Infinity;
+        if (!newestFetched || lagDays >= STALE_LAG_DAYS) {
+            throw new Error(`数据过期（疑似中间层缓存）：接口显示最新比赛 ${apiLastPlayed}，`
+                + `本次只抓到 ${newestFetched || '0 场'}（落后 ${Number.isFinite(lagDays) ? lagDays + ' 天' : '全部'}）`);
+        }
     }
 
     return {
@@ -352,6 +372,7 @@ async function syncPlayer(wrId, opts = {}) {
 function classifySyncError(msg) {
     const m = String(msg || '');
     if (/403/.test(m)) return 'forbidden';
+    if (/数据过期/.test(m)) return 'stale';
     if (/JSON 解析失败|非 JSON/.test(m)) return 'json';
     if (/响应异常/.test(m)) return 'contract';
     if (/ID 映射/.test(m)) return 'idmap';
@@ -394,13 +415,13 @@ async function syncAll(players, opts = {}) {
     if (opts.full !== false && players.length - failed.length > 0) meta.lastFullSync = new Date().toISOString();
     writeMeta(meta);
 
-    const failTypes = { forbidden: 0, json: 0, contract: 0, idmap: 0, other: 0 };
+    const failTypes = { forbidden: 0, stale: 0, json: 0, contract: 0, idmap: 0, other: 0 };
     failed.forEach(f => { failTypes[f.type] = (failTypes[f.type] || 0) + 1; });
     const success = players.length - failed.length;
 
     console.log(`\n同步完成: ${success}/${players.length} 成功, ${failed.length} 失败`);
     if (failed.length > 0) {
-        console.log(`  失败分类: 403拦截=${failTypes.forbidden}, JSON解析=${failTypes.json}, 响应异常=${failTypes.contract}, ID映射=${failTypes.idmap}, 网络/其它=${failTypes.other}`);
+        console.log(`  失败分类: 403拦截=${failTypes.forbidden}, 数据过期=${failTypes.stale}, JSON解析=${failTypes.json}, 响应异常=${failTypes.contract}, ID映射=${failTypes.idmap}, 网络/其它=${failTypes.other}`);
         console.log('  失败列表:', failed.map(f => `${f.player.cnName}(wrId=${f.player.wrId})`).join(', '));
     }
     if (emptyWindow > 0) {
@@ -762,6 +783,7 @@ function getStats() {
     const meta = readMeta();
     let playerFiles = 0;
     let totalMatches = 0;
+    let newestMatchDate = '';
     if (fs.existsSync(PLAYERS_DIR)) {
         fs.readdirSync(PLAYERS_DIR).forEach(f => {
             if (f.endsWith('.json')) {
@@ -769,14 +791,26 @@ function getStats() {
                 try {
                     const d = JSON.parse(fs.readFileSync(path.join(PLAYERS_DIR, f), 'utf8'));
                     totalMatches += (d.matchCount || 0);
+                    if (Array.isArray(d.matches)) {
+                        for (const m of d.matches) {
+                            if (m.date && m.date > newestMatchDate) newestMatchDate = m.date;
+                        }
+                    }
                 } catch {}
             }
         });
     }
+    // 数据新鲜度：最新比赛距今天数（>1 说明同步链路没有拿到最新数据，页面应在状态里提示）
+    const staleDays = newestMatchDate
+        ? Math.max(0, Math.floor((Date.now() - Date.parse(newestMatchDate + 'T00:00:00')) / 86400000))
+        : null;
     return {
         lastFullSync: meta.lastFullSync,
         playerFiles,
         totalMatches,
+        newestMatchDate: newestMatchDate || null,
+        staleDays,
+        lastClient: meta.client || null,
         dataDir: DATA_DIR,
     };
 }

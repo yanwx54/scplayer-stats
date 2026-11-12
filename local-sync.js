@@ -232,6 +232,13 @@ async function attachChrome() {
 // 因此所有 API 请求都必须在页面上下文执行，不能再走 context.request。
 const API_PROBE_URL = 'https://eloboard.com/api/players?limit=1&offset=0';
 
+// 给 URL 追加一次性时间戳：绕开 eloboard /api/* 中间层按 URL 键控的缓存
+// （2026-11 曾出现"每次同步都成功，但比赛数据冻结在 11-07"——同一 URL 命中旧快照）
+function bustCache(url) {
+    if (/[?&]_t=/.test(url)) return url;
+    return url + (url.includes('?') ? '&' : '?') + '_t=' + Date.now();
+}
+
 // 页面内 fetch，返回 { status, text }
 async function pageFetch(page, url) {
     return page.evaluate(async (u) => {
@@ -239,7 +246,7 @@ async function pageFetch(page, url) {
         let text = '';
         try { text = await resp.text(); } catch (e) { text = ''; }
         return { status: resp.status, text };
-    }, url);
+    }, bustCache(url));
 }
 
 // 页面内取 JSON；错误信息带分类前缀（403 拦截 / HTTP 状态 / JSON 解析），便于统计
@@ -477,6 +484,47 @@ function formatNow() {
     return new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
 }
 
+// 北京时间当天（YYYY-MM-DD）
+function todayShanghai() {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+}
+
+function daysBetween(fromDate, toDate) {
+    return Math.round((Date.parse(toDate + 'T00:00:00') - Date.parse(fromDate + 'T00:00:00')) / 86400000);
+}
+
+// 全局新鲜度：本次同步涉及的选手里最新的比赛日期
+function freshnessOf(wrIds) {
+    let newest = '';
+    let have = 0;
+    wrIds.forEach(id => {
+        const d = db.readPlayerData(id);
+        if (!d || !Array.isArray(d.matches) || d.matches.length === 0) return;
+        have++;
+        const max = d.matches.reduce((m, x) => (x.date && x.date > m ? x.date : m), '');
+        if (max > newest) newest = max;
+    });
+    return { newest, playersWithData: have, players: wrIds.length };
+}
+
+// 把客户端版本写进 meta：服务器 /api/status 可据此确认同步端跑的是哪一版代码
+function stampClientMeta() {
+    try {
+        const meta = db.readMeta();
+        meta.client = {
+            version: require('./package.json').version,
+            gitHead: (() => { try { return execSync('git rev-parse --short HEAD', { cwd: __dirname }).toString().trim(); } catch (e) { return ''; } })(),
+            hostname: os.hostname(),
+            cacheBust: true,
+            staleGuardDays: 2,
+            recordedAt: new Date().toISOString(),
+        };
+        db.writeMeta(meta);
+    } catch (e) {
+        console.log(`⚠ 写入客户端版本信息失败（已忽略）：${e.message}`);
+    }
+}
+
 function readLogTail(limit = 25) {
     try {
         const p = path.join(__dirname, 'sync-local.log');
@@ -493,7 +541,7 @@ function failureSummaryLines(result) {
     if (!result) return lines;
     const ft = result.failTypes || {};
     lines.push(`结果：成功 ${result.success}/${result.total}，失败 ${result.failed.length}`);
-    lines.push(`失败分类：403拦截=${ft.forbidden || 0}，JSON解析=${ft.json || 0}，响应异常=${ft.contract || 0}，ID映射=${ft.idmap || 0}，网络/其它=${ft.other || 0}`);
+    lines.push(`失败分类：403拦截=${ft.forbidden || 0}，数据过期=${ft.stale || 0}，JSON解析=${ft.json || 0}，响应异常=${ft.contract || 0}，ID映射=${ft.idmap || 0}，网络/其它=${ft.other || 0}`);
     if (result.emptyWindow) lines.push(`窗口内 0 场：${result.emptyWindow} 人（休眠选手或无新比赛，非错误）`);
     if (result.failed.length > 0) {
         lines.push('', '错误行（日志摘录）：');
@@ -697,6 +745,47 @@ async function main() {
             conclusion: '线上数据未更新（本次 0 人成功，已跳过上传；服务器仍为上一次成功同步的数据）',
         });
         throw new Error('0 个选手同步成功（疑似数据源拦截或接口异常）');
+    }
+
+    // ---- 全局新鲜度断言 ----
+    // 防"看似成功其实抓到旧快照"：2026-11-08 起同步端连续 5 天 60 人全部"成功"，
+    // 但 /api/matches 返回的一直是 11-07 的快照，页面因此一直停在 11-06/11-07。
+    // 分级：落后 ≥3 天视为链路整体失效（告警 + 阻断，不上传旧快照后推进计时器）；
+    //       落后 2 天可能只是赛程空档（告警但继续上传）；≤1 天正常。
+    const fresh = freshnessOf(players.map(p => p.wrId));
+    const lagDays = fresh.newest ? daysBetween(fresh.newest, todayShanghai()) : Infinity;
+    stampClientMeta();
+    if (fresh.playersWithData > 0 && lagDays >= 2) {
+        const lines = [
+            `最新比赛：${fresh.newest}（今天 ${todayShanghai()}，落后 ${lagDays} 天）`,
+            `涉及选手：${fresh.playersWithData} 人有比赛数据`,
+            '排查顺序：①抓取 URL 是否带 _t 缓存参数（应随每次请求变化）',
+            '②同步端网络出口是否命中 CDN/代理缓存（换网络或用手机热点复测）',
+            '③eloboard 站点是否改版（页面内 fetch 的 /api 结构变化）',
+        ].join('\n');
+        if (lagDays >= 3) {
+            console.error(`✗ 数据过期：最新比赛 ${fresh.newest}，落后今天（${todayShanghai()}）${lagDays} 天，跳过上传`);
+            await sendFailureAlert(config, {
+                reasonKey: 'stale-data',
+                title: '抓到的比赛数据整体过期',
+                mode: modeText,
+                result,
+                conclusion: '线上数据未更新（本次抓到的比赛数据整体过期，已跳过上传；疑似 eloboard /api 中间层缓存或接口降级）',
+                extraLines: lines,
+            });
+            throw new Error(`数据过期：最新比赛 ${fresh.newest}，落后今天 ${lagDays} 天（疑似中间层缓存）`);
+        }
+        console.log(`⚠ 最新比赛 ${fresh.newest}（落后今天 ${lagDays} 天）——可能为赛程空档，继续上传，仅发提醒`);
+        await sendFailureAlert(config, {
+            reasonKey: 'stale-data-soft',
+            title: '最新比赛已落后 ' + lagDays + ' 天（提醒）',
+            mode: modeText,
+            result,
+            conclusion: '线上数据已更新（落后 2 天，未达 3 天阻断阈值；若连续多天如此请排查）',
+            extraLines: lines,
+        });
+    } else {
+        console.log(`✓ 数据新鲜：最新比赛 ${fresh.newest}`);
     }
 
     // 部分失败：失败占比达到阈值（默认 20%，配置 mail.failRatioThreshold）也告警
