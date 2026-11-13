@@ -752,10 +752,13 @@ async function main() {
     // 但 /api/matches 返回的一直是 11-07 的快照，页面因此一直停在 11-06/11-07。
     // 分级：落后 ≥3 天视为链路整体失效（告警 + 阻断，不上传旧快照后推进计时器）；
     //       落后 2 天可能只是赛程空档（告警但继续上传）；≤1 天正常。
+    // 注意：只在全量/增量整库同步时断言——指定选手（测试模式）只抓 1 人，
+    //       休眠选手最近没比赛是正常现象，不代表链路过期（2026-11-13 曾误报）。
+    const isWholeLibraryRun = opts.wrIds.length === 0;
     const fresh = freshnessOf(players.map(p => p.wrId));
     const lagDays = fresh.newest ? daysBetween(fresh.newest, todayShanghai()) : Infinity;
     stampClientMeta();
-    if (fresh.playersWithData > 0 && lagDays >= 2) {
+    if (isWholeLibraryRun && fresh.playersWithData > 0 && lagDays >= 2) {
         const lines = [
             `最新比赛：${fresh.newest}（今天 ${todayShanghai()}，落后 ${lagDays} 天）`,
             `涉及选手：${fresh.playersWithData} 人有比赛数据`,
