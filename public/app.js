@@ -58,16 +58,26 @@ async function init() {
 async function loadSyncStatus() {
     try {
         const s = await fetch('/api/status').then(r => r.json());
-        updateSyncDisplay(s.lastFullSync);
+        // 优先用"数据里最新比赛日期"（增量同步也会推进）；老服务器无此字段时退回 lastFullSync
+        updateSyncDisplay(s.newestMatchDate || s.lastFullSync, s.staleDays);
     } catch {}
 }
 
-function updateSyncDisplay(lastSync) {
+function updateSyncDisplay(lastSync, staleDays) {
     if (!lastSync) { syncInfo.textContent = 'SYNC: 从未'; syncInfo.classList.add('stale'); return; }
-    const d = new Date(lastSync);
-    const days = Math.floor((Date.now() - d.getTime()) / 86400000);
+    let d, days;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(lastSync)) { // newestMatchDate：纯日期按本地时区解析
+        d = new Date(lastSync + 'T00:00:00');
+        days = (staleDays != null && Number.isFinite(+staleDays)) ? +staleDays
+            : Math.floor((Date.now() - d.getTime()) / 86400000);
+    } else {
+        d = new Date(lastSync);
+        days = Math.floor((Date.now() - d.getTime()) / 86400000);
+    }
     const dateStr = `${d.getMonth() + 1}/${d.getDate()}`;
-    syncInfo.textContent = `SYNC: ${dateStr} (${days}天前)`;
+    const dayLabel = days <= 0 ? '今天' : (days === 1 ? '昨天' : `${days}天前`);
+    syncInfo.textContent = `SYNC: ${dateStr} (${dayLabel})`;
+    syncInfo.title = `数据内最新比赛日期：${lastSync}`;
     syncInfo.classList.toggle('stale', days > 7);
 }
 
